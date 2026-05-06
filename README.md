@@ -15,7 +15,7 @@ Sophon itself is an iOS chat app for agents you already run. The private app, cl
 ## Install the skill
 
 ```sh
-npx skillsadd serafim-labs/Sophon
+npx skills add serafim-labs/Sophon
 ```
 
 If your agent supports manual skill installation, copy:

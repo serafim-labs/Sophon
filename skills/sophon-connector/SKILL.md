@@ -1,5 +1,6 @@
 ---
 name: sophon-connector
+description: Build a Sophon connector that exposes an existing agent runtime in the Sophon iOS app.
 summary: Build a Sophon connector that exposes an existing agent runtime in the Sophon iOS app.
 version: 0.1.0
 ---

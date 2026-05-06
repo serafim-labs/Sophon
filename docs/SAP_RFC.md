@@ -32,7 +32,7 @@
 19a. [Observability](#19a-observability)
 20. [Security](#20-security)
 21. [Versioning & deprecation](#21-versioning--deprecation)
-22. [Open questions](#22-open-questions)
+22. [Roadmap](#22-roadmap)
 23. [Examples](#23-examples)
 
 ---
@@ -1672,18 +1672,19 @@ When SAP v2 is announced (no earlier than v1 + 12 months), Sophon ships:
 
 ---
 
-## 22. Open questions
+## 22. Roadmap
 
-Items deferred to v0.2 spec or follow-up RFCs:
+SAP v1 focuses on the connector path that is available today: user-initiated chat sessions, streaming assistant replies, tool progress, and human approvals.
 
-- **Voice mode wire format.** § 6.10 / § 7 stub exists; full spec including TTS/STT streaming, interruption semantics, latency budgets — TBD.
-- **Multi-agent in one thread.** v1 = single-agent sessions. Adding @-mention support requires session model extension and is deferred to v0.2.
-- **MCP Apps inline UI.** `sendRichUI` method stubbed; full spec for HTML iframe sandboxing, postMessage protocol, declarative resources — TBD.
-- **A2A bridge.** Allowing Sophon agents to call other Sophon agents (or external A2A agents) via SAP — TBD when use cases emerge.
-- **Cost ceilings enforcement.** § 16 mentions per-tenant circuit breakers; spec of `402 Payment Required` semantics + grace periods — TBD.
-- **Quality scoring formula.** § 16.2 mentions but exact weights/formula not yet locked.
-- **Team org model.** § 19 assumes personal account ownership. Multi-user team accounts (where agent is co-owned, billing shared) — v2.
-- **Scheduled / cron triggers.** Agents triggered without user action (daily summaries, etc.) — TBD.
+Future protocol work will stay backwards-compatible where possible and will be published as separate versioned RFCs. Areas we expect to evolve include:
+
+- **Voice interactions** - low-latency speech input/output for agent sessions.
+- **Richer app surfaces** - structured UI blocks beyond text, tasks, and approvals.
+- **Team deployments** - shared connector ownership, permissions, and billing controls.
+- **Scheduled runs** - user-authorized agent activity that starts outside an active chat turn.
+- **Cross-agent workflows** - controlled handoffs between compatible agent runtimes.
+
+Items on this roadmap are directional and are not part of the SAP v1 compatibility contract until a versioned RFC marks them stable.
 
 ---
 

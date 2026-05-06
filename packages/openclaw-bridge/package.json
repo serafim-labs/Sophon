@@ -1,0 +1,31 @@
+{
+  "name": "@sophon/openclaw-bridge",
+  "version": "0.1.0",
+  "description": "Bridge a self-hosted OpenClaw gateway through Sophon's SAP — install one agent on Sophon and chat with your local OpenClaw.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "sophon-openclaw-bridge": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

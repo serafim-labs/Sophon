@@ -1,0 +1,17 @@
+{
+  "name": "sophon-open-source",
+  "private": true,
+  "description": "Open-source Sophon connector examples, skills, and protocol references.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "examples/connectors/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

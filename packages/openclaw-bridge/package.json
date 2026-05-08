@@ -1,11 +1,24 @@
 {
-  "name": "@sophon/openclaw-bridge",
-  "version": "0.1.0",
-  "description": "Bridge a self-hosted OpenClaw gateway through Sophon's SAP — install one agent on Sophon and chat with your local OpenClaw.",
+  "name": "@sophonai/bridge",
+  "version": "0.5.4",
+  "description": "Connect local agents (OpenClaw, more soon) to Sophon — one CLI for all bridges.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/serafim-labs/sophon/tree/main/packages/openclaw-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/serafim-labs/sophon.git",
+    "directory": "packages/openclaw-bridge"
+  },
+  "bugs": {
+    "url": "https://github.com/serafim-labs/sophon/issues"
+  },
   "type": "module",
   "bin": {
-    "sophon-openclaw-bridge": "dist/cli.js"
+    "bridge": "dist/cli.js",
+    "sophon-bridge": "dist/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",

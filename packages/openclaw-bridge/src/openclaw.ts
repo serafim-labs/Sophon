@@ -80,6 +80,11 @@ export class OpenClawClient {
   private streamHandlers = new Map<string, AgentStreamHandlers>() // runId → handlers
   private streamCumulative = new Map<string, string>() // runId → cumulative text
   private sessionRunIds = new Map<string, string>() // sessionKey → active runId
+  // Run-ids whose lifecycle:end carried `replayInvalid: true` — async
+  // approval pause. We keep their handlers + cumulative text alive so
+  // the followup turn (new runId, same sessionKey) can rebind onto the
+  // same listeners and stream the post-approval reply through to iOS.
+  private pausedRunIds = new Set<string>()
   // (runId) → set of `${toolCallId}|${phase}` already forwarded to
   // onTool. Dedup guard for OpenClaw's habit of fanning the same
   // tool lifecycle through both `stream:'item' kind:'tool'` AND
@@ -91,9 +96,22 @@ export class OpenClawClient {
     this.streamHandlers.delete(runId)
     this.streamCumulative.delete(runId)
     this.toolPhasesSeen.delete(runId)
+    this.pausedRunIds.delete(runId)
     for (const [sessionKey, rid] of this.sessionRunIds) {
       if (rid === runId) this.sessionRunIds.delete(sessionKey)
     }
+  }
+
+  /** Tie-breaker when an unbound runId arrives without a sessionKey
+   *  in the payload. If exactly one paused run exists, that's our
+   *  best guess for which session the followup belongs to. */
+  private findPausedSessionKey(): string | undefined {
+    if (this.pausedRunIds.size !== 1) return undefined
+    const [pausedRunId] = this.pausedRunIds
+    for (const [sessionKey, rid] of this.sessionRunIds) {
+      if (rid === pausedRunId) return sessionKey
+    }
+    return undefined
   }
 
   private alreadyForwarded(runId: string, toolCallId: string, phase: string): boolean {
@@ -236,8 +254,36 @@ export class OpenClawClient {
           }
           const runId = payload.runId
           if (!runId) return
-          const handlers = this.streamHandlers.get(runId)
-          if (!handlers) return
+          let handlers = this.streamHandlers.get(runId)
+          if (!handlers) {
+            // Followup-after-approval rebind. OpenClaw mints a fresh
+            // runId for the post-approval continuation; events arrive
+            // here with no listener. If a paused run exists for the
+            // same sessionKey, migrate its handlers + cumulative
+            // buffer to the new runId so the followup streams
+            // through unchanged.
+            const sessionKey = (payload.data as { sessionKey?: string })?.sessionKey
+              ?? this.findPausedSessionKey()
+            if (sessionKey) {
+              const pausedRunId = this.sessionRunIds.get(sessionKey)
+              if (pausedRunId && this.pausedRunIds.has(pausedRunId)) {
+                handlers = this.streamHandlers.get(pausedRunId)
+                if (handlers) {
+                  this.streamHandlers.set(runId, handlers)
+                  const carry = this.streamCumulative.get(pausedRunId) ?? ''
+                  this.streamCumulative.set(runId, carry)
+                  this.streamCumulative.delete(pausedRunId)
+                  this.streamHandlers.delete(pausedRunId)
+                  this.toolPhasesSeen.set(runId, this.toolPhasesSeen.get(pausedRunId) ?? new Set())
+                  this.toolPhasesSeen.delete(pausedRunId)
+                  this.sessionRunIds.set(sessionKey, runId)
+                  this.pausedRunIds.delete(pausedRunId)
+                  this.log(`[openclaw] followup rebind: paused ${pausedRunId} → ${runId} (session=${sessionKey})`)
+                }
+              }
+            }
+            if (!handlers) return
+          }
           // Trace every agent frame in verbose mode so unexpected
           // wire shapes (new stream channels, missing toolCallIds,
           // …) are visible without re-instrumenting the file.
@@ -255,6 +301,23 @@ export class OpenClawClient {
             return
           }
           if (payload.stream === 'lifecycle' && payload.data?.phase === 'end') {
+            // OpenClaw signals "this run paused on async approval, more
+            // events will arrive on a new runId after the user
+            // resolves" via `replayInvalid: true` on the lifecycle-end
+            // frame. Without this guard bridge fired `onFinal` with
+            // empty text, sendEnd closed the iOS bubble, and the
+            // followup-turn events that landed after the user tapped
+            // approve never made it through (handlers cleaned up,
+            // followup runId had no listener). Treat replayInvalid as
+            // a soft-pause: keep handlers + cumulative buffer alive and
+            // also re-bind the next runId for this sessionKey so the
+            // followup turn flows through the same handler chain.
+            const replayInvalid = (payload.data as { replayInvalid?: boolean })?.replayInvalid === true
+            if (replayInvalid) {
+              this.log(`[openclaw] lifecycle:end replayInvalid=true — pausing run ${runId} (await followup)`)
+              this.pausedRunIds.add(runId)
+              return
+            }
             const finalText = this.streamCumulative.get(runId) ?? ''
             if (handlers.onFinal) handlers.onFinal({ text: finalText })
             this.cleanupRun(runId)
@@ -431,6 +494,14 @@ export class OpenClawClient {
           // text — agent stream might miss the very last chunk if the
           // run aborts. Delta path goes through `agent` event above.
           if (payload.state === 'final') {
+            // If this run is paused on async approval, the chat
+            // channel still emits `state=final` for the pre-approval
+            // sub-turn. Suppress onFinal in that case so iOS doesn't
+            // see sendEnd before the approved followup arrives.
+            if (this.pausedRunIds.has(runId)) {
+              this.log(`[openclaw] chat:final for paused run ${runId} — suppressing onFinal (await followup)`)
+              return
+            }
             const finalText = fullText || this.streamCumulative.get(runId) || ''
             if (handlers.onFinal) handlers.onFinal({ text: finalText, usage: payload.usage })
             this.cleanupRun(runId)
@@ -496,14 +567,15 @@ export class OpenClawClient {
   async chatSend(input: {
     sessionKey: string
     message: string
-    /** Optional file/image attachments. Each gets `{ url, mime, name }`
-     *  passed to OpenClaw — the gateway fetches by URL and fans the
-     *  bytes into the run's media pipeline. URLs come from
-     *  /v1/uploads and are short-lived signed links. */
+    /** Optional file/image attachments in OpenClaw's `chat.send`
+     *  attachment shape — `{ mimeType, fileName, content: <base64> }`.
+     *  bridge.ts is responsible for fetching the source bytes (R2 or
+     *  inline) and base64-encoding before this point; OpenClaw's
+     *  attachment normaliser rejects anything else. */
     attachments?: ReadonlyArray<{
-      url: string
-      mime: string
-      name?: string | null
+      mimeType: string
+      fileName: string
+      content: string
     }>
     handlers: AgentStreamHandlers
   }): Promise<{ runId: string }> {
@@ -517,12 +589,7 @@ export class OpenClawClient {
       idempotencyKey,
     }
     if (input.attachments && input.attachments.length > 0) {
-      params.attachments = input.attachments.map((a, index) => ({
-        index,
-        url: a.url,
-        mime: a.mime,
-        ...(a.name ? { name: a.name } : {}),
-      }))
+      params.attachments = input.attachments
     }
     const payload = await new Promise<unknown>((resolve, reject) => {
       this.pending.set(reqId, { resolve, reject })

@@ -27,6 +27,10 @@ export interface SophonClientOpts {
   baseUrl: string // e.g. https://api.sophon.at
   botToken: string
   log?: (line: string) => void
+  /** Fires once per WS open. Use it to print a `[ready]` sentinel or
+   *  flip a "we're talking to Sophon" indicator. Called for every
+   *  reconnect, not just the first — caller dedupes if needed. */
+  onConnected?: () => void
 }
 
 export class SophonClient {
@@ -37,10 +41,12 @@ export class SophonClient {
   private stopped = false
   private updateHandler: ((u: SophonUpdate) => Promise<void>) | null = null
   private log: (line: string) => void
+  private onConnected?: () => void
 
   constructor(opts: SophonClientOpts) {
     this.opts = opts
     this.log = opts.log ?? (() => {})
+    this.onConnected = opts.onConnected
   }
 
   onUpdate(handler: (u: SophonUpdate) => Promise<void>): void {
@@ -87,9 +93,53 @@ export class SophonClient {
     })
 
     this.log('[sophon] connected')
+    try {
+      this.onConnected?.()
+    } catch {
+      // never let a misbehaving consumer kill the WS lifecycle
+    }
 
     return new Promise<void>((resolve, reject) => {
+      // Two-pronged liveness watchdog:
+      //
+      //  (a) **Inbound-byte gap**: server pings every 25s + update frames
+      //      during traffic. If we go 30s without ANY inbound message,
+      //      the socket is wedged on a half-broken connection (Wi-Fi
+      //      flap, NAT timeout, server restart). The `close`/`error`
+      //      events don't fire in this state; we have to terminate
+      //      ourselves so the close handler kicks reconnect.
+      //
+      //  (b) **Time-jump (laptop wake-from-sleep)**: when the lid was
+      //      closed, the WS died on the server side, but the local TCP
+      //      socket sits frozen — no event fires. We detect "tick took
+      //      way longer than its interval" as a sleep signal and
+      //      reconnect immediately. Without this, every wake meant
+      //      ~30s of "iOS shows offline" before (a) caught it.
+      let lastInbound = Date.now()
+      let lastTick = Date.now()
+      const TICK_MS = 5_000
+      const SLEEP_THRESHOLD_MS = 12_000   // tick gap > 12s ≈ machine slept
+      const IDLE_THRESHOLD_MS = 30_000    // 30s of silence ≈ zombie WS
+      const watchdog = setInterval(() => {
+        const now = Date.now()
+        const tickGap = now - lastTick
+        lastTick = now
+        if (tickGap > SLEEP_THRESHOLD_MS) {
+          this.log(`[sophon] wake detected (tick gap ${Math.round(tickGap / 1000)}s) — terminating`)
+          clearInterval(watchdog)
+          try { ws.terminate() } catch { /* noop */ }
+          return
+        }
+        const idleMs = now - lastInbound
+        if (idleMs > IDLE_THRESHOLD_MS) {
+          this.log(`[sophon] no inbound for ${Math.round(idleMs / 1000)}s — terminating`)
+          clearInterval(watchdog)
+          try { ws.terminate() } catch { /* noop */ }
+        }
+      }, TICK_MS)
+
       ws.on('message', (raw) => {
+        lastInbound = Date.now()
         let frame: Record<string, unknown> = {}
         try {
           frame = JSON.parse(raw.toString('utf8'))
@@ -124,8 +174,14 @@ export class SophonClient {
           })()
         }
       })
-      ws.on('close', () => resolve())
-      ws.on('error', reject)
+      ws.on('close', () => {
+        clearInterval(watchdog)
+        resolve()
+      })
+      ws.on('error', (err) => {
+        clearInterval(watchdog)
+        reject(err)
+      })
     })
   }
 

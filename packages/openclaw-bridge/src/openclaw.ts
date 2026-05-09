@@ -519,8 +519,21 @@ export class OpenClawClient {
             return
           }
 
-          if (payload.state === 'aborted' || payload.state === 'error') {
-            const msg = payload.errorMessage ?? payload.state ?? 'unknown error'
+          if (payload.state === 'aborted') {
+            // User-initiated stop. Treat as a graceful finalisation
+            // instead of an error — iOS shouldn't see "[OpenClaw error]
+            // aborted" when the user themselves tapped Stop. Whatever
+            // streamed before the abort stays as the bubble content;
+            // if nothing streamed, we still close cleanly with empty
+            // text. The lifecycle:end frame that follows is a no-op
+            // because cleanupRun removed the handlers.
+            const finalText = this.streamCumulative.get(runId) ?? ''
+            if (handlers.onFinal) handlers.onFinal({ text: finalText })
+            this.cleanupRun(runId)
+            return
+          }
+          if (payload.state === 'error') {
+            const msg = payload.errorMessage ?? 'unknown error'
             if (handlers.onError) handlers.onError(msg)
             this.cleanupRun(runId)
             return
@@ -609,6 +622,64 @@ export class OpenClawClient {
     this.streamHandlers.set(runId, input.handlers)
     this.sessionRunIds.set(input.sessionKey, runId)
     return { runId }
+  }
+
+  /**
+   * Abort an in-flight chat run. Mirrors the gateway's `chat.abort`
+   * RPC (`reference: openclaw-full/src/gateway/server-methods/chat.ts`):
+   *
+   *   params: { sessionKey: string, runId?: string }
+   *   response: { ok: true, aborted: boolean, runIds: string[] }
+   *
+   * When `runId` is omitted, the gateway aborts every active run for
+   * the given `sessionKey`. That's the right shape for SAP's
+   * `session.cancelled` (user tapped Stop on the chat) — the user
+   * means "stop everything in this chat right now", not "stop run X".
+   *
+   * Returns the response payload so the caller can log how many runs
+   * were actually aborted; zero is a valid no-op (the run may have
+   * finalised between the SAP cancel and this RPC).
+   */
+  async chatAbort(input: {
+    sessionKey: string
+    runId?: string
+  }): Promise<{ aborted: boolean; runIds: string[] }> {
+    if (!this.connected || !this.ws) throw new Error('not connected')
+    const reqId = randomUUID()
+    const params: Record<string, unknown> = { sessionKey: input.sessionKey }
+    if (input.runId) params.runId = input.runId
+    const payload = await new Promise<unknown>((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject })
+      this.ws!.send(
+        JSON.stringify({
+          type: 'req',
+          id: reqId,
+          method: 'chat.abort',
+          params,
+        }),
+      )
+    })
+    const result = (payload ?? {}) as {
+      aborted?: boolean
+      runIds?: string[]
+    }
+    const aborted = result.aborted ?? false
+    const runIds = result.runIds ?? []
+    this.log(
+      `[openclaw] chat.abort ack sessionKey=${input.sessionKey}` +
+        (input.runId ? ` runId=${input.runId}` : '') +
+        ` aborted=${aborted} runIds=[${runIds.join(',')}]`,
+    )
+    // Best-effort local bookkeeping: drop the sessionKey→runId binding
+    // so a follow-up chat.send for this sessionKey doesn't try to bind
+    // a fresh runId onto the now-aborted slot.
+    if (aborted) {
+      const tracked = this.sessionRunIds.get(input.sessionKey)
+      if (tracked && (!input.runId || tracked === input.runId)) {
+        this.sessionRunIds.delete(input.sessionKey)
+      }
+    }
+    return { aborted, runIds }
   }
 
   /**

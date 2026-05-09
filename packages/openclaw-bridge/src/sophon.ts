@@ -11,7 +11,18 @@
  */
 
 import { WebSocket } from 'ws'
+import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
+
+import { deriveBlobKey, encryptSymmetric } from './crypto.js'
+
+/** Bridge package version. Track package.json — server captures this
+ *  via the post-open `hello` frame and stores it on installations.row
+ *  so iOS can gate viewer affordances by capability (file viewer
+ *  requires >= 0.6.0; e2e message-text in 0.7.0; tasks + approvals
+ *  e2e in 0.8.0; Phase 4b cutover — plaintext-write paths removed —
+ *  in 0.9.0). */
+const BRIDGE_VERSION = '0.9.0'
 
 export interface SophonUpdate {
   update_id: string
@@ -31,6 +42,12 @@ export interface SophonClientOpts {
    *  flip a "we're talking to Sophon" indicator. Called for every
    *  reconnect, not just the first — caller dedupes if needed. */
   onConnected?: () => void
+  /** 32-byte e2e install key from credentials.json. When set, the
+   *  client encrypts outbound wire fields (message text, tool args,
+   *  file paths) per docs/ENCRYPTION_PLAN.md §3. Phase 3.1 just
+   *  threads the key through; field-by-field wiring follows in
+   *  later phases. */
+  installKey?: Uint8Array
 }
 
 export class SophonClient {
@@ -40,17 +57,46 @@ export class SophonClient {
   private readonly maxReconnectMs = 30_000
   private stopped = false
   private updateHandler: ((u: SophonUpdate) => Promise<void>) | null = null
+  /** Server → bridge RPC handler. Any frame with `req_id` (other than
+   *  the well-known envelope types like `update`/`ping`/`pong`) is
+   *  dispatched here. The handler returns the reply payload; the
+   *  envelope (`req_id`, `type=<X>.resp`) is added by the message
+   *  loop. Used by the file viewer (`file.read.req`). */
+  private requestHandler:
+    | ((frame: Record<string, unknown>) => Promise<Record<string, unknown>>)
+    | null = null
   private log: (line: string) => void
   private onConnected?: () => void
+  /** When non-null, the client encrypts wire fields. Visible to
+   *  outbound RPC methods so each can decide whether to wrap in
+   *  ciphertext or pass through as plaintext (legacy mode). */
+  protected installKey: Uint8Array | null
 
   constructor(opts: SophonClientOpts) {
     this.opts = opts
     this.log = opts.log ?? (() => {})
     this.onConnected = opts.onConnected
+    this.installKey = opts.installKey ?? null
+  }
+
+  /** True iff this client has an install_key and will encrypt wire
+   *  fields. Bridge code branches on this to decide whether new
+   *  ciphertext fields go on the request or stay legacy plaintext. */
+  hasInstallKey(): boolean {
+    return this.installKey !== null
   }
 
   onUpdate(handler: (u: SophonUpdate) => Promise<void>): void {
     this.updateHandler = handler
+  }
+
+  /** Register a handler for server → bridge RPCs. The frame argument
+   *  has the full request including `type` and `req_id`; the resolved
+   *  payload becomes the reply (envelope added automatically). */
+  onRequest(
+    handler: (frame: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  ): void {
+    this.requestHandler = handler
   }
 
   async start(): Promise<void> {
@@ -93,6 +139,16 @@ export class SophonClient {
     })
 
     this.log('[sophon] connected')
+    // Announce our version to the server so it can stamp
+    // installations.bridge_version. Sent before any other frame.
+    // Server treats unknown frame types as a no-op (forward-compat),
+    // so older servers safely ignore this.
+    try {
+      ws.send(JSON.stringify({ type: 'hello', version: BRIDGE_VERSION }))
+    } catch {
+      // If the very first send fails the close path will fire and
+      // reconnect — don't surface here.
+    }
     try {
       this.onConnected?.()
     } catch {
@@ -153,6 +209,31 @@ export class SophonClient {
           return
         }
         if (type === 'pong') return
+        // Server → bridge RPC. Anything with a `req_id` that isn't an
+        // envelope frame above is a request the SAP wants us to fulfil
+        // (file viewer reads, future capability probes). Dispatch to
+        // the registered handler async — large file reads can take
+        // hundreds of ms; we don't want to block the inbound loop.
+        if (typeof frame.req_id === 'string' && this.requestHandler) {
+          const reqId = frame.req_id
+          const replyType = type ? `${type.replace(/\.req$/, '')}.resp` : 'rpc.resp'
+          ;(async () => {
+            let reply: Record<string, unknown>
+            try {
+              reply = await this.requestHandler!(frame)
+            } catch (err) {
+              reply = {
+                error: { code: 'handler_failed', message: (err as Error).message },
+              }
+            }
+            try {
+              ws.send(JSON.stringify({ ...reply, type: replyType, req_id: reqId }))
+            } catch (err) {
+              this.log(`[sophon] reply send failed: ${(err as Error).message}`)
+            }
+          })()
+          return
+        }
         if (type === 'update') {
           const update = frame.update as SophonUpdate | undefined
           if (!update) return
@@ -203,6 +284,59 @@ export class SophonClient {
     return data as Record<string, unknown>
   }
 
+  /** Per-session blob_key for messages. Each session gets its own
+   *  AES key derived from install_key + HKDF info
+   *  `messages/<session_id>`. Per-session (not per-message) because
+   *  deltas accumulate to the same logical bubble and the bridge
+   *  doesn't know `message_id` before calling
+   *  `startStreamingMessage`. iOS uses the same path on read. Throws
+   *  when there's no install_key — post-cutover the bridge MUST be
+   *  paired e2e to send anything. */
+  protected messagesBlobKey(sessionId: string): Uint8Array {
+    if (!this.installKey) {
+      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
+    }
+    return deriveBlobKey(this.installKey, `messages/${sessionId}`)
+  }
+
+  /** AES-GCM-encrypt UTF-8 text under the per-session messages
+   *  blob_key. Returns base64 of the versioned envelope. Throws when
+   *  install_key is missing. */
+  protected encryptMessageText(sessionId: string, text: string): string {
+    const key = this.messagesBlobKey(sessionId)
+    const env = encryptSymmetric(new TextEncoder().encode(text), key)
+    return Buffer.from(env).toString('base64')
+  }
+
+  /** Per-session blob_key for tasks. Same shape as
+   *  `messagesBlobKey` — fine-grained per-task derivation isn't
+   *  worth the complexity for v1 since tasks are read in batches
+   *  anyway. Throws when no install_key. */
+  protected tasksBlobKey(sessionId: string): Uint8Array {
+    if (!this.installKey) {
+      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
+    }
+    return deriveBlobKey(this.installKey, `tasks/${sessionId}`)
+  }
+
+  /** Encrypt an arbitrary JSON-shaped value (input/partial_result/
+   *  result) under the tasks blob_key. The plaintext is the
+   *  JSON-stringified payload; iOS parses on decrypt. */
+  protected encryptTaskJson(sessionId: string, value: unknown): string {
+    const key = this.tasksBlobKey(sessionId)
+    const json = JSON.stringify(value ?? null)
+    const env = encryptSymmetric(new TextEncoder().encode(json), key)
+    return Buffer.from(env).toString('base64')
+  }
+
+  /** Encrypt a small text field (status_label / error) under the
+   *  tasks blob_key. */
+  protected encryptTaskText(sessionId: string, text: string): string {
+    const key = this.tasksBlobKey(sessionId)
+    const env = encryptSymmetric(new TextEncoder().encode(text), key)
+    return Buffer.from(env).toString('base64')
+  }
+
   /** Atomic non-streaming reply. */
   async sendMessage(input: {
     sessionId: string
@@ -211,7 +345,7 @@ export class SophonClient {
   }): Promise<{ messageId: string }> {
     const data = await this.post('/v1/bridge/sendMessage', {
       session_id: input.sessionId,
-      text: input.text,
+      text_ct: this.encryptMessageText(input.sessionId, input.text),
       idempotency_key: randomUUID(),
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
     })
@@ -219,14 +353,16 @@ export class SophonClient {
     return { messageId: result.message_id ?? '' }
   }
 
-  /** Streaming start — reply with empty text so iOS shows a placeholder. */
+  /** Streaming start — open the row with an empty-string envelope so
+   *  iOS gets a placeholder bubble immediately. Deltas append to it
+   *  in-memory; sendMessageEnd replaces with the canonical full text. */
   async startStreamingMessage(input: {
     sessionId: string
     interactionId?: string | null
   }): Promise<{ messageId: string }> {
     const data = await this.post('/v1/bridge/sendMessage', {
       session_id: input.sessionId,
-      text: ' ', // server requires non-empty
+      text_ct: this.encryptMessageText(input.sessionId, ''),
       idempotency_key: randomUUID(),
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
     })
@@ -234,22 +370,34 @@ export class SophonClient {
     return { messageId: result.message_id ?? '' }
   }
 
-  async sendDelta(messageId: string, delta: string): Promise<void> {
+  /** Append a streaming chunk. The delta is independently encrypted
+   *  under the same session blob_key — server forwards over SSE
+   *  without ever touching plaintext. iOS decrypts each delta as it
+   *  arrives and appends to the bubble. */
+  async sendDelta(input: {
+    messageId: string
+    sessionId: string
+    delta: string
+  }): Promise<void> {
     await this.post('/v1/bridge/sendMessageDelta', {
-      message_id: messageId,
-      delta,
+      message_id: input.messageId,
+      delta_ct: this.encryptMessageText(input.sessionId, input.delta),
       idempotency_key: randomUUID(),
     })
   }
 
   async sendEnd(input: {
     messageId: string
+    sessionId: string
     text?: string
     usage?: Record<string, unknown>
   }): Promise<void> {
+    const textCt = input.text !== undefined
+      ? this.encryptMessageText(input.sessionId, input.text)
+      : null
     await this.post('/v1/bridge/sendMessageEnd', {
       message_id: input.messageId,
-      ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(textCt ? { text_ct: textCt } : {}),
       ...(input.usage ? { usage: input.usage } : {}),
       idempotency_key: randomUUID(),
     })
@@ -267,16 +415,21 @@ export class SophonClient {
     statusLabel?: string
     args?: unknown
   }): Promise<void> {
-    // Idempotency key derived from (taskId, phase): same logical
-    // tool-call → same key. If the HTTP retry layer fires twice, the
-    // server collapses both onto a single task_created SSE event.
+    // E2E: encrypt content-bearing fields (status_label, args) under
+    // the per-session tasks blob_key. `kind` stays plaintext — it's
+    // a tool-name enum (Read/Edit/Bash/...) used by the iOS deck for
+    // icon/color routing and is not user content.
     await this.post('/v1/bridge/createTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
       kind: input.kind,
-      ...(input.statusLabel ? { status_label: input.statusLabel } : {}),
-      ...(input.args !== undefined ? { args: input.args } : {}),
+      ...(input.statusLabel
+        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
+        : {}),
+      ...(input.args !== undefined
+        ? { args_ct: this.encryptTaskJson(input.sessionId, input.args) }
+        : {}),
       idempotency_key: `task:create:${input.taskId}`,
     })
   }
@@ -289,18 +442,17 @@ export class SophonClient {
     progressPercent?: number
     partialResult?: unknown
   }): Promise<void> {
-    // Update can fire many times for one task. Caller passes a unique
-    // taskId per logical update batch; pair with random suffix so
-    // multiple progress frames for the same taskId are not collapsed.
-    // The retry safety only applies to a single (logical) update —
-    // OpenClaw drives one HTTP call per progress frame.
     await this.post('/v1/bridge/updateTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
-      ...(input.statusLabel ? { status_label: input.statusLabel } : {}),
+      ...(input.statusLabel
+        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
+        : {}),
       ...(input.progressPercent !== undefined ? { progress_percent: input.progressPercent } : {}),
-      ...(input.partialResult !== undefined ? { partial_result: input.partialResult } : {}),
+      ...(input.partialResult !== undefined
+        ? { partial_result_ct: this.encryptTaskJson(input.sessionId, input.partialResult) }
+        : {}),
       idempotency_key: `task:update:${input.taskId}:${randomUUID()}`,
     })
   }
@@ -315,19 +467,67 @@ export class SophonClient {
     error?: string
     result?: unknown
   }): Promise<void> {
-    // Same as createTask: one logical termination per (taskId,
-    // status) — derive a stable key so retries dedupe on the server.
     await this.post('/v1/bridge/finishTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
       ...(input.name ? { name: input.name } : {}),
       status: input.status,
-      ...(input.statusLabel ? { status_label: input.statusLabel } : {}),
-      ...(input.error ? { error: input.error } : {}),
-      ...(input.result !== undefined ? { result: input.result } : {}),
+      ...(input.statusLabel
+        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
+        : {}),
+      ...(input.error
+        ? { error_ct: this.encryptTaskText(input.sessionId, input.error) }
+        : {}),
+      ...(input.result !== undefined
+        ? { result_ct: this.encryptTaskJson(input.sessionId, input.result) }
+        : {}),
       idempotency_key: `task:finish:${input.taskId}:${input.status}`,
     })
+  }
+
+  // ─── Tool-touched files — populates session_agent_files on the
+  //     server so iOS can list "files modified in this chat" and gate
+  //     /file proxy reads on a session-scoped whitelist.
+  //
+  //     Best-effort: a notify failure just means iOS won't see the file
+  //     in the list (and /file would return 403). The tool-call itself
+  //     already streams via createTask/finishTask — losing the notify
+  //     is at most a UX regression, not a functional one. Log + swallow.
+
+  /**
+   * Records a file the agent touched. `pathCt` / `displayNameCt` are
+   * AES-GCM envelopes under the per-install path-derived blob_key;
+   * `pathBlindIdx` is the HMAC server lookup key. Computed by
+   * bridge.ts trackToolFile. Post Phase 4b cutover all three are
+   * required (the row PK is `(session_id, path_blind_idx)` and the
+   * server has no plaintext path column anymore).
+   */
+  async notifyToolFile(input: {
+    sessionId: string
+    tool: 'read' | 'edit' | 'write'
+    sizeBytes?: number
+    mime?: string
+    /** AES-GCM ciphertext envelope (base64) of the realpath. */
+    pathCt: string
+    /** AES-GCM ciphertext envelope (base64) of the basename. */
+    displayNameCt: string
+    /** HMAC blind-index (base64url, 22 chars). */
+    pathBlindIdx: string
+  }): Promise<void> {
+    try {
+      await this.post('/v1/bridge/notifyToolFile', {
+        session_id: input.sessionId,
+        tool: input.tool,
+        ...(input.sizeBytes !== undefined ? { size_bytes: input.sizeBytes } : {}),
+        ...(input.mime ? { mime: input.mime } : {}),
+        path_ct: input.pathCt,
+        display_name_ct: input.displayNameCt,
+        path_blind_idx: input.pathBlindIdx,
+      })
+    } catch (err) {
+      this.log(`[sophon] notifyToolFile failed: ${(err as Error).message}`)
+    }
   }
 
   // ─── Approval surface — fans OpenClaw `stream:"approval"` to SAP
@@ -347,18 +547,33 @@ export class SophonClient {
     host?: string
     message: string
   }): Promise<void> {
+    // Encrypt the full details payload under per-session approvals
+    // blob_key. iOS decrypts on the SSE event. Throws when no
+    // install_key (post-cutover the bridge MUST be e2e).
+    if (!this.installKey) {
+      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
+    }
+    const blobKey = deriveBlobKey(this.installKey, `approvals/${input.sessionId}`)
+    const details = {
+      title: input.title,
+      message: input.message,
+      command: input.command,
+      host: input.host,
+      tool_call_id: input.toolCallId,
+      approval_slug: input.approvalSlug,
+    }
+    const env = encryptSymmetric(
+      new TextEncoder().encode(JSON.stringify(details)),
+      blobKey,
+    )
+    const detailsCt = Buffer.from(env).toString('base64')
     await this.post('/v1/bridge/requestApproval', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       approval_id: input.approvalId,
-      ...(input.approvalSlug ? { approval_slug: input.approvalSlug } : {}),
       action: input.action,
-      ...(input.toolCallId ? { tool_call_id: input.toolCallId } : {}),
-      title: input.title,
       severity: input.severity ?? 'medium',
-      ...(input.command ? { command: input.command } : {}),
-      ...(input.host ? { host: input.host } : {}),
-      message: input.message,
+      details_ct: detailsCt,
       idempotency_key: randomUUID(),
     })
   }

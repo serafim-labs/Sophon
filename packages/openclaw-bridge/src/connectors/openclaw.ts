@@ -1,6 +1,7 @@
 import { hostname, homedir } from 'node:os'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { Buffer } from 'node:buffer'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
@@ -300,6 +301,12 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
   }
 
   let installationId: string | undefined
+  // E2E install key (32 raw bytes). Loaded from credentials.json on
+  // existing-pair startup, or freshly derived on a new pair() handshake.
+  // Threaded through to SophonClient + Bridge so encryption sub-paths
+  // can branch on `hasInstallKey()`. Plain `undefined` ⇒ legacy bridge
+  // running in plaintext mode (same as pre-0.7.0 behaviour).
+  let installKey: Uint8Array | undefined
 
   if (!args.openclawUrl || !args.openclawToken) {
     const ready = await ensureGatewayInitialized(args.yes)
@@ -340,7 +347,12 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
     if (saved?.botToken) {
       args.sophonToken = saved.botToken
       installationId = saved.installationId
-      human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())}`)
+      if (saved.installKeyHex && /^[0-9a-f]{64}$/.test(saved.installKeyHex)) {
+        installKey = Uint8Array.from(Buffer.from(saved.installKeyHex, 'hex'))
+        human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())} ${dim('(e2e enabled)')}`)
+      } else {
+        human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())}`)
+      }
     }
   }
 
@@ -362,10 +374,14 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
       })
       args.sophonToken = result.botToken
       installationId = result.installationId
+      if (result.installKeyHex) {
+        installKey = Uint8Array.from(Buffer.from(result.installKeyHex, 'hex'))
+      }
       await saveCredentials({
         botToken: result.botToken,
         installationId: result.installationId,
         sophonBase: args.sophonBase,
+        ...(result.installKeyHex ? { installKeyHex: result.installKeyHex } : {}),
       })
       human(`${green('✓')} saved Sophon credentials to ${dim(credentialsLocation())}`)
     } catch (err) {
@@ -422,8 +438,15 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
       firstReadyFired = true
       firstSophonOpen()
     },
+    ...(installKey ? { installKey } : {}),
   })
-  const bridge = new Bridge({ sophon, openclaw, log, debugStream: args.debugStream })
+  const bridge = new Bridge({
+    sophon,
+    openclaw,
+    log,
+    debugStream: args.debugStream,
+    ...(installKey ? { installKey } : {}),
+  })
   if (args.debugStream) {
     process.stderr.write(`${dim('debug-stream: ON — per-token telemetry will print to stderr')}\n`)
   }

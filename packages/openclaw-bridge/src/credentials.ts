@@ -6,6 +6,14 @@ export interface SavedCredentials {
   botToken: string
   installationId?: string
   sophonBase?: string
+  /**
+   * E2E install key as 64-char hex (32 raw bytes). Set when the
+   * bridge paired via the new ECDH-based handshake (>= 0.7.0). When
+   * absent we run in legacy plaintext-mode and the server stores
+   * everything in cleartext — same as old bridges before this change.
+   * See docs/ENCRYPTION_PLAN.md §5.
+   */
+  installKeyHex?: string
   savedAt: string
 }
 
@@ -33,6 +41,7 @@ export async function saveCredentials(input: {
   botToken: string
   installationId?: string
   sophonBase: string
+  installKeyHex?: string
 }): Promise<void> {
   const path = credentialsPath()
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
@@ -43,6 +52,7 @@ export async function saveCredentials(input: {
         botToken: input.botToken,
         installationId: input.installationId,
         sophonBase: input.sophonBase,
+        ...(input.installKeyHex ? { installKeyHex: input.installKeyHex } : {}),
         savedAt: new Date().toISOString(),
       } satisfies SavedCredentials,
       null,

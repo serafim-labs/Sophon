@@ -1,6 +1,6 @@
 {
   "name": "@sophonai/bridge",
-  "version": "0.5.4",
+  "version": "0.10.0",
   "description": "Connect local agents (OpenClaw, more soon) to Sophon — one CLI for all bridges.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/serafim-labs/sophon/tree/main/packages/openclaw-bridge#readme",
@@ -27,16 +27,19 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
+    "tweetnacl": "^1.0.3",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.9"
   },
   "engines": {
     "node": ">=20"

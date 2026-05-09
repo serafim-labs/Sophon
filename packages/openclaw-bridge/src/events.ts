@@ -35,6 +35,7 @@ export type EventName =
   | 'pairing_browser_opened'
   | 'pairing_waiting'
   | 'pairing_claimed'
+  | 'pairing_e2e_sas'
   | 'pairing_expired'
   | 'pairing_timeout'
   | 'openclaw_connected'

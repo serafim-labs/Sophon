@@ -120,6 +120,20 @@ $ npx @sophonai/bridge doctor
 
 Run `npx @sophonai/bridge <connector> --help` for connector-specific flags.
 
+### openclaw compatibility
+
+The bridge negotiates OpenClaw's WS handshake protocol versions **3..4** (`OPENCLAW_MIN_PROTOCOL`/`OPENCLAW_MAX_PROTOCOL` in [`src/openclaw.ts`](./src/openclaw.ts)). Any OpenClaw whose gateway speaks one of those handshakes will pair.
+
+| Bridge | OpenClaw stable known-good | Notes |
+|---|---|---|
+| `0.13.x` | `2026.5.5` – `2026.5.9` | protocol 3 |
+| `0.13.x` | `2026.5.10-beta.x` and later | protocol 4 — bridge speaks it but stable hasn't shipped yet |
+| `≤ 0.12.x` | `≤ 2026.5.7` | protocol 3 only |
+
+If the handshake fails with `INVALID_REQUEST protocol mismatch` in `~/Library/Logs/sophon-bridge/err.log`, the gateway is on a wire version outside that window — either upgrade `@sophonai/bridge` or pin OpenClaw to a supported release.
+
+Known upstream gotcha — `openclaw@2026.5.7` shipped with an incomplete `dist/` (some tool chunks missing from the npm tarball), so on that exact version `read`/`web_search`/`web_fetch`/`exec` tools throw `ERR_MODULE_NOT_FOUND` in OpenClaw's log. Chat itself still works. Upgrade to `2026.5.8+` once it lands, or sit on `2026.5.6`.
+
 ## openclaw flags
 
 ```sh

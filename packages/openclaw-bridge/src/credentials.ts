@@ -7,13 +7,22 @@ export interface SavedCredentials {
   installationId?: string
   sophonBase?: string
   /**
-   * E2E install key as 64-char hex (32 raw bytes). Set when the
-   * bridge paired via the new ECDH-based handshake (>= 0.7.0). When
-   * absent we run in legacy plaintext-mode and the server stores
-   * everything in cleartext — same as old bridges before this change.
-   * See docs/ENCRYPTION_PLAN.md §5.
+   * Long-term X25519 keypair that identifies this bridge as a `devices`
+   * row on the server (platform='bridge'). The pubkey is registered
+   * via POST /v1/bridge/devices on every WS connect; siblings encrypt
+   * session_keys for us under this pubkey via sealed-box.
+   *
+   * Generated on first boot and persisted across restarts. Wiping
+   * these forces all session_keys to be re-granted by sibling devices
+   * (and the existing wrappers on the server become useless).
+   *
+   * Repurposed from the pre-0.12.0 install_key handshake where the
+   * same keypair was used for ECDH-derived install_key. Migration
+   * 0023 dropped install_key entirely; the bytes here now serve only
+   * as long-term device identity.
    */
-  installKeyHex?: string
+  bridgeSecretHex?: string
+  bridgePubkeyHex?: string
   savedAt: string
 }
 
@@ -41,7 +50,8 @@ export async function saveCredentials(input: {
   botToken: string
   installationId?: string
   sophonBase: string
-  installKeyHex?: string
+  bridgeSecretHex?: string
+  bridgePubkeyHex?: string
 }): Promise<void> {
   const path = credentialsPath()
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
@@ -52,7 +62,8 @@ export async function saveCredentials(input: {
         botToken: input.botToken,
         installationId: input.installationId,
         sophonBase: input.sophonBase,
-        ...(input.installKeyHex ? { installKeyHex: input.installKeyHex } : {}),
+        ...(input.bridgeSecretHex ? { bridgeSecretHex: input.bridgeSecretHex } : {}),
+        ...(input.bridgePubkeyHex ? { bridgePubkeyHex: input.bridgePubkeyHex } : {}),
         savedAt: new Date().toISOString(),
       } satisfies SavedCredentials,
       null,

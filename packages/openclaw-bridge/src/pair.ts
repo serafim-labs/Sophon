@@ -23,24 +23,21 @@
 import { Buffer } from 'node:buffer'
 import { emit, human, isJsonMode } from './events.js'
 import { bold, cyan, dim, green, spinner } from './style.js'
-import {
-  deriveInstallKeyFromECDH,
-  deriveSASFromECDH,
-  generateKeypair,
-} from './crypto.js'
-import { sasToEmojis } from './sas-emojis.js'
+import { generateKeypair } from './crypto.js'
 
 export interface PairingResult {
   botToken: string
   sophonWsUrl: string
   installationId: string
   /**
-   * 32-byte install_key as hex. Present when both sides participated
-   * in the e2e ECDH handshake (bridge >= 0.7.0 + iOS app >= 0.7.0).
-   * Caller persists via `saveCredentials({ installKeyHex })`.
-   * Absent when either side is legacy (no e2e for this install).
+   * Bridge X25519 keypair, generated fresh per first pairing. Caller
+   * persists both halves via `saveCredentials({ bridgeSecretHex,
+   * bridgePubkeyHex })`. Post-0.12.0 these no longer derive an
+   * install_key — they identify this bridge as a long-term `devices`
+   * row, registered via POST /v1/bridge/devices on connect.
    */
-  installKeyHex?: string
+  bridgeSecretHex: string
+  bridgePubkeyHex: string
 }
 
 export interface PairOptions {
@@ -64,10 +61,10 @@ const TICKER_MS = 15_000
 export async function pair(opts: PairOptions): Promise<PairingResult> {
   const print = opts.print ?? ((line: string) => human(line))
 
-  // Generate the X25519 keypair up front. We send the pubkey in
-  // /pairing/start; iOS posts its own pubkey at /me/pairing/claim.
-  // Both sides then derive install_key + SAS via ECDH. See
-  // docs/ENCRYPTION_PLAN.md §5 for the full handshake.
+  // Generate the long-term X25519 device identity for this bridge.
+  // Persisted to credentials.json + registered with the server via
+  // POST /v1/bridge/devices once the bot_token is in hand. SAS-based
+  // MitM defense is a TODO post-0.12.0 (no users to protect yet).
   const bridgeKeypair = generateKeypair()
   const bridgePubkeyHex = Buffer.from(bridgeKeypair.publicKey).toString('hex')
 
@@ -78,7 +75,6 @@ export async function pair(opts: PairOptions): Promise<PairingResult> {
     body: JSON.stringify({
       connector_type_id: opts.connectorTypeId,
       ...(opts.hostLabel ? { host_label: opts.hostLabel } : {}),
-      bridge_pubkey: bridgePubkeyHex,
     }),
   })
   if (!startResp.ok) {
@@ -203,7 +199,6 @@ export async function pair(opts: PairOptions): Promise<PairingResult> {
           bot_token?: string
           installation_id?: string
           sophon_ws_url?: string
-          ios_pubkey?: string | null
         }
         error?: { code: string }
       }
@@ -212,55 +207,21 @@ export async function pair(opts: PairOptions): Promise<PairingResult> {
       }
       const status = body.result.status
       if (status === 'claimed') {
-        const { bot_token, installation_id, sophon_ws_url, ios_pubkey } = body.result
+        const { bot_token, installation_id, sophon_ws_url } = body.result
         if (!bot_token || !installation_id || !sophon_ws_url) {
           throw new Error('pairing/poll claimed but missing fields')
         }
         emit('pairing_claimed', { installation_id })
         stopTicker()
         print(`  ${green('✓')} paired ${dim('— installation')} ${bold(installation_id)}`)
-
-        // E2E branch: iOS posted its pubkey, derive install_key + SAS.
-        // Drop into legacy plaintext mode if iOS is older / didn't post.
-        //
-        // We persist `installKeyHex` optimistically — i.e., before iOS
-        // user has confirmed the SAS visually. If they reject the SAS
-        // ("emojis don't match — abort"), iOS wipes its Keychain copy
-        // and the next encrypted blob from THIS bridge will be
-        // undecryptable on iOS. The user re-pairs to recover.
-        // Acceptable v1 trade-off — alternative would require a second
-        // round-trip from iOS to bridge for "SAS confirmed" before we
-        // touch disk, doubling the protocol's moving parts. The MitM
-        // protection itself is intact: a compromised server can't fake
-        // matching emojis on both screens, so SAS-confirmed pairings
-        // are real e2e regardless of when the bridge writes its file.
-        let installKeyHex: string | undefined
-        if (ios_pubkey && /^[0-9a-f]{64}$/.test(ios_pubkey)) {
-          const iosPub = Uint8Array.from(Buffer.from(ios_pubkey, 'hex'))
-          const installKey = deriveInstallKeyFromECDH(bridgeKeypair.secretKey, iosPub)
-          const sas = deriveSASFromECDH(bridgeKeypair.secretKey, iosPub)
-          installKeyHex = Buffer.from(installKey).toString('hex')
-
-          emit('pairing_e2e_sas', {
-            sas_hex: Buffer.from(sas).toString('hex'),
-            sas_emojis: sasToEmojis(sas),
-          })
-          print('')
-          print(`  ${dim('Verify the SAS code matches on your iPhone:')}`)
-          print(`    ${bold(sasToEmojis(sas))}`)
-          print(`    ${dim('hex: ' + Buffer.from(sas).toString('hex'))}`)
-          print('')
-          print(`  ${green('✓')} end-to-end encryption enabled for this install`)
-        } else {
-          print(`  ${dim('(legacy plaintext mode — iOS did not provide a pubkey)')}`)
-        }
         print('')
 
         return {
           botToken: bot_token,
           sophonWsUrl: sophon_ws_url,
           installationId: installation_id,
-          installKeyHex,
+          bridgeSecretHex: Buffer.from(bridgeKeypair.secretKey).toString('hex'),
+          bridgePubkeyHex,
         }
       }
       if (status === 'expired') {

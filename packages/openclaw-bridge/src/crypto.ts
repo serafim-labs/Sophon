@@ -31,6 +31,11 @@ import nacl from 'tweetnacl'
 /** Symmetric AEAD format version. Bump when the layout changes. */
 export const SYMM_VERSION_V1 = 0x01
 
+/** Sealed-box (anonymous-recipient ECIES) format version.
+ *  Layout:  [0x02] [ephemeral_pubkey 32] [inner symmetric envelope]
+ *  See `sealedBoxEncrypt` for the construction. */
+export const SEALED_BOX_VERSION_V1 = 0x02
+
 /** Reserved sentinel — encrypted-empty (encoded plaintext was zero
  *  length). Single byte, distinguishable from any valid v1 envelope
  *  because v1 starts with version byte 0x01. Lets callers tell apart
@@ -327,4 +332,103 @@ function deriveECDHKey(
   const shared = nacl.box.before(theirPublic, mySecret)
   const out = hkdfSync('sha256', shared, new Uint8Array(0), Buffer.from(info, 'utf8'), length)
   return new Uint8Array(out as ArrayBuffer)
+}
+
+// ─── Sealed-box (anonymous-recipient ECIES) ─────────────────────────
+//
+// Encrypt a payload (typically a 32-byte session_key) for one recipient
+// identified by their long-term X25519 pubkey. Sender doesn't need a
+// long-term identity — a fresh ephemeral keypair is generated per call,
+// the public half is bundled with the ciphertext, and the secret half
+// is discarded. This gives forward secrecy on the wrap side: an
+// attacker who later compromises a sender's long-term key gains
+// nothing about already-wrapped session keys.
+//
+// Wire format (62-byte overhead):
+//   [version 0x02] [eph_pub 32 B] [inner symmetric envelope (1+12+N+16)]
+//
+// The inner envelope is exactly what `encryptSymmetric` emits — same
+// version byte 0x01 nested inside, AES-256-GCM body keyed by
+//   shared = HKDF-SHA256(ECDH(eph_sec, recipient_pub),
+//                        info = "sophon/v1/sealed-box")
+//
+// Recipient recovers `shared` from `ECDH(recipient_sec, eph_pub)` and
+// the same HKDF info, then decrypts via `decryptSymmetric`. AEAD
+// failure returns `null` (timing-uniform with bad-key / tamper).
+
+const SEALED_BOX_KDF_INFO = `${KDF_PREFIX}/sealed-box`
+
+/** Encrypt `plaintext` so that only the holder of the secret matching
+ *  `recipientPublic` can decrypt. Generates a fresh ephemeral X25519
+ *  keypair internally and zeroes the secret half after derivation. */
+export function sealedBoxEncrypt(
+  plaintext: Uint8Array,
+  recipientPublic: Uint8Array,
+): Uint8Array {
+  if (recipientPublic.length !== X25519_KEY_BYTES) {
+    throw new Error(
+      `bad recipientPublic length: expected ${X25519_KEY_BYTES}, got ${recipientPublic.length}`,
+    )
+  }
+  const eph = nacl.box.keyPair()
+  const shared = nacl.box.before(recipientPublic, eph.secretKey)
+  const sharedKey = hkdfSync(
+    'sha256',
+    shared,
+    new Uint8Array(0),
+    Buffer.from(SEALED_BOX_KDF_INFO, 'utf8'),
+    AES_KEY_BYTES,
+  )
+  const inner = encryptSymmetric(plaintext, new Uint8Array(sharedKey as ArrayBuffer))
+  // Best-effort wipe of the ephemeral secret + derived shared. Doesn't
+  // help against a heap dump but limits the lifetime of the bytes in
+  // long-running processes.
+  eph.secretKey.fill(0)
+  ;(shared as Uint8Array).fill(0)
+
+  const envelope = new Uint8Array(1 + X25519_KEY_BYTES + inner.length)
+  envelope[0] = SEALED_BOX_VERSION_V1
+  envelope.set(eph.publicKey, 1)
+  envelope.set(inner, 1 + X25519_KEY_BYTES)
+  return envelope
+}
+
+/** Decrypt a `sealedBoxEncrypt` envelope addressed to a holder of
+ *  `recipientSecret`. Returns the plaintext, or `null` on AEAD failure
+ *  (wrong key / tampered bytes / wrong recipient). Throws on structural
+ *  problems (truncation, unknown version). */
+export function sealedBoxDecrypt(
+  envelope: Uint8Array,
+  recipientSecret: Uint8Array,
+): Uint8Array | null {
+  if (recipientSecret.length !== X25519_KEY_BYTES) {
+    throw new Error(
+      `bad recipientSecret length: expected ${X25519_KEY_BYTES}, got ${recipientSecret.length}`,
+    )
+  }
+  if (envelope.length === 0) {
+    throw new MalformedEnvelopeError('empty buffer')
+  }
+  const version = envelope[0]
+  if (version !== SEALED_BOX_VERSION_V1) {
+    throw new UnsupportedVersionError(version ?? -1)
+  }
+  const minLength = 1 + X25519_KEY_BYTES + 1 // outer header + at least the inner version byte
+  if (envelope.length < minLength) {
+    throw new MalformedEnvelopeError(`length ${envelope.length} < min ${minLength}`)
+  }
+  const ephPub = envelope.slice(1, 1 + X25519_KEY_BYTES)
+  const inner = envelope.slice(1 + X25519_KEY_BYTES)
+
+  const shared = nacl.box.before(ephPub, recipientSecret)
+  const sharedKey = hkdfSync(
+    'sha256',
+    shared,
+    new Uint8Array(0),
+    Buffer.from(SEALED_BOX_KDF_INFO, 'utf8'),
+    AES_KEY_BYTES,
+  )
+  ;(shared as Uint8Array).fill(0)
+
+  return decryptSymmetric(inner, new Uint8Array(sharedKey as ArrayBuffer))
 }

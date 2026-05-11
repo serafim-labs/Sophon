@@ -1,6 +1,6 @@
 {
   "name": "@sophonai/bridge",
-  "version": "0.10.0",
+  "version": "0.13.7",
   "description": "Connect local agents (OpenClaw, more soon) to Sophon — one CLI for all bridges.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/serafim-labs/sophon/tree/main/packages/openclaw-bridge#readme",
@@ -14,14 +14,14 @@
   },
   "type": "module",
   "bin": {
-    "bridge": "dist/cli.js",
-    "sophon-bridge": "dist/cli.js"
+    "bridge": "dist/cli.js"
   },
   "publishConfig": {
     "access": "public"
   },
   "files": [
     "dist",
+    "install.sh",
     "README.md"
   ],
   "scripts": {

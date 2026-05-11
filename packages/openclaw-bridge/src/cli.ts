@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path'
 import { openclawConnector } from './connectors/openclaw.js'
 import { ExitCode } from './exit-codes.js'
 import { setJsonMode, isJsonMode, emit, human, alwaysStderr } from './events.js'
+import { runService } from './service.js'
 import { bold, brand, cyan, dim, green, red } from './style.js'
 import type { ConnectorRunner } from './connectors/types.js'
 
@@ -46,6 +47,7 @@ ${brand(PKG_NAME)} ${dim('— connect local agents to Sophon')}
 
 ${bold('Usage:')}
   npx ${PKG_NAME} <connector> [flags]
+  npx ${PKG_NAME} service <command>    ${dim('# install/uninstall/status/restart/logs (macOS launchd)')}
   npx ${PKG_NAME} doctor [connector]   ${dim('# preflight checklist')}
   npx ${PKG_NAME} status               ${dim('# show saved credentials + paths')}
   npx ${PKG_NAME} --version
@@ -69,6 +71,8 @@ ${bold('Exit codes:')}
 
 ${bold('Examples:')}
   npx ${PKG_NAME} openclaw                ${dim('# zero-config bridge to local OpenClaw')}
+  npx ${PKG_NAME} service install         ${dim('# run the bridge under launchd — terminal can close')}
+  npx ${PKG_NAME} service status          ${dim('# loaded? running? last exit?')}
   npx ${PKG_NAME} doctor                  ${dim('# check the openclaw setup')}
   npx ${PKG_NAME} openclaw --json --yes   ${dim('# agent-mode: NDJSON, no prompts')}
   npx ${PKG_NAME} openclaw --manual-pair  ${dim('# SSH/headless: print a 7-letter code')}
@@ -77,7 +81,7 @@ ${bold('Examples:')}
 }
 
 function suggestSubcommand(input: string): string | null {
-  const known = [...Object.keys(CONNECTORS), 'doctor', 'status', 'help']
+  const known = [...Object.keys(CONNECTORS), 'doctor', 'status', 'service', 'help']
   let best: { name: string; dist: number } | null = null
   for (const k of known) {
     const d = levenshtein(input, k)
@@ -177,7 +181,7 @@ async function main(): Promise<void> {
           summary: c.summary,
           has_doctor: Boolean(c.doctor),
         })),
-        global_subcommands: ['doctor', 'status', '--version', '--help'],
+        global_subcommands: ['doctor', 'status', 'service', '--version', '--help'],
         global_flags: ['--json', '--verbose'],
       }) + '\n')
     } else {
@@ -193,6 +197,11 @@ async function main(): Promise<void> {
 
   if (argv[0] === 'status') {
     await printStatus()
+    process.exit(ExitCode.Ok)
+  }
+
+  if (argv[0] === 'service') {
+    await runService(argv.slice(1))
     process.exit(ExitCode.Ok)
   }
 

@@ -18,6 +18,8 @@ import {
   loadCredentials,
   saveCredentials,
 } from '../credentials.js'
+import { generateKeypair } from '../crypto.js'
+import { SessionKeyStore } from '../session-keys.js'
 import { ExitCode } from '../exit-codes.js'
 import { emit, human, isJsonMode } from '../events.js'
 import { bold, brand, cyan, dim, green, red, yellow } from '../style.js'
@@ -44,6 +46,13 @@ interface OpenclawArgs {
    * `SOPHON_DEBUG_STREAM=1`.
    */
   debugStream: boolean
+  /**
+   * Exit immediately after pairing succeeds (saved creds → return 0).
+   * Used internally by `bridge service install` to drive interactive
+   * pairing before handing the long-lived connection over to launchd.
+   * Triggered by `--pair-only` or `SOPHON_PAIR_ONLY=1`.
+   */
+  pairOnly: boolean
 }
 
 const OPENCLAW_USAGE = `
@@ -72,6 +81,10 @@ Flags:
                    OpenClaw delta + sendDelta round-trip + sendEnd to
                    stderr. High-volume; use only when debugging "why
                    isn't streaming working". Independent of --verbose.
+  --pair-only      Exit immediately after pairing — don't connect to
+                   OpenClaw or Sophon. Used by \`bridge service install\`
+                   to drive the browser/iOS dance before launchd takes
+                   over. Skips if credentials are already saved.
   --help, -h       This help.
 
 Env: OPENCLAW_STATE_DIR, OPENCLAW_URL, OPENCLAW_TOKEN, SOPHON_BOT_TOKEN,
@@ -89,6 +102,7 @@ function parseOpenclawArgs(argv: string[]): OpenclawArgs {
     logout: false,
     yes: process.env.SOPHON_YES === '1',
     debugStream: process.env.SOPHON_DEBUG_STREAM === '1',
+    pairOnly: process.env.SOPHON_PAIR_ONLY === '1',
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
@@ -102,6 +116,7 @@ function parseOpenclawArgs(argv: string[]): OpenclawArgs {
     else if (a === '--logout') opts.logout = true
     else if (a === '--yes' || a === '-y') opts.yes = true
     else if (a === '--debug-stream') opts.debugStream = true
+    else if (a === '--pair-only') opts.pairOnly = true
     else if (a === '--verbose' || a === '-v') {
       // handled at dispatcher level; no-op here
     } else if (a === '--help' || a === '-h') {
@@ -301,12 +316,6 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
   }
 
   let installationId: string | undefined
-  // E2E install key (32 raw bytes). Loaded from credentials.json on
-  // existing-pair startup, or freshly derived on a new pair() handshake.
-  // Threaded through to SophonClient + Bridge so encryption sub-paths
-  // can branch on `hasInstallKey()`. Plain `undefined` ⇒ legacy bridge
-  // running in plaintext mode (same as pre-0.7.0 behaviour).
-  let installKey: Uint8Array | undefined
 
   if (!args.openclawUrl || !args.openclawToken) {
     const ready = await ensureGatewayInitialized(args.yes)
@@ -342,16 +351,37 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
   human(`  ${dim('openclaw:')} ${args.openclawUrl}`)
   human('')
 
+  // Long-term bridge X25519 device identity. Persisted in
+  // credentials.json across restarts. Wiped credentials → fresh
+  // keypair → server-side device row gets re-registered on connect
+  // and existing wrappers under the old pubkey are dropped.
+  let bridgeSecretKey: Uint8Array | undefined
+  let bridgePubkeyHex: string | undefined
+  let bridgeSecretJustGenerated = false
+  let justPaired = false
+
   if (!args.sophonToken) {
     const saved = await loadCredentials(args.sophonBase)
     if (saved?.botToken) {
       args.sophonToken = saved.botToken
       installationId = saved.installationId
-      if (saved.installKeyHex && /^[0-9a-f]{64}$/.test(saved.installKeyHex)) {
-        installKey = Uint8Array.from(Buffer.from(saved.installKeyHex, 'hex'))
-        human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())} ${dim('(e2e enabled)')}`)
-      } else {
-        human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())}`)
+      human(`${green('✓')} loaded Sophon credentials from ${dim(credentialsLocation())}`)
+      if (
+        saved.bridgeSecretHex &&
+        /^[0-9a-f]{64}$/.test(saved.bridgeSecretHex) &&
+        saved.bridgePubkeyHex &&
+        /^[0-9a-f]{64}$/.test(saved.bridgePubkeyHex)
+      ) {
+        bridgeSecretKey = Uint8Array.from(Buffer.from(saved.bridgeSecretHex, 'hex'))
+        bridgePubkeyHex = saved.bridgePubkeyHex
+      } else if (saved.botToken) {
+        // Legacy install (paired pre-0.12.0). Mint a fresh device
+        // identity so we can register on the new `devices` table.
+        const kp = generateKeypair()
+        bridgeSecretKey = kp.secretKey
+        bridgePubkeyHex = Buffer.from(kp.publicKey).toString('hex')
+        bridgeSecretJustGenerated = true
+        human(`${cyan('→')} ${dim('upgrading credentials.json with bridge device keypair (one-time)')}`)
       }
     }
   }
@@ -374,14 +404,17 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
       })
       args.sophonToken = result.botToken
       installationId = result.installationId
-      if (result.installKeyHex) {
-        installKey = Uint8Array.from(Buffer.from(result.installKeyHex, 'hex'))
-      }
+      bridgeSecretKey = Uint8Array.from(Buffer.from(result.bridgeSecretHex, 'hex'))
+      bridgePubkeyHex = result.bridgePubkeyHex
+      justPaired = true
       await saveCredentials({
         botToken: result.botToken,
         installationId: result.installationId,
         sophonBase: args.sophonBase,
-        ...(result.installKeyHex ? { installKeyHex: result.installKeyHex } : {}),
+        // Long-term bridge device identity — registered with the
+        // server post-connect via POST /v1/bridge/devices.
+        bridgeSecretHex: result.bridgeSecretHex,
+        bridgePubkeyHex: result.bridgePubkeyHex,
       })
       human(`${green('✓')} saved Sophon credentials to ${dim(credentialsLocation())}`)
     } catch (err) {
@@ -403,6 +436,23 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
     }
   }
 
+  // --pair-only: stop after credentials are saved. Used by
+  // `bridge service install` to drive the interactive browser/iOS
+  // dance and then hand the long-lived connection over to launchd.
+  // We don't connect to OpenClaw or Sophon here — the launchd-managed
+  // process will do that on its first KeepAlive boot.
+  if (args.pairOnly) {
+    emit('paired_only', {
+      installation_id: installationId ?? null,
+      credentials_file: credentialsLocation(),
+      already_paired: !justPaired,
+    })
+    human('')
+    human(`${green('✓')} ${justPaired ? 'pairing complete' : 'already paired'} ${dim(`(${credentialsLocation()})`)}`)
+    if (installationId) human(`  ${dim('installation:')} ${bold(installationId)}`)
+    return
+  }
+
   const openclaw = new OpenClawClient({
     url: args.openclawUrl,
     token: args.openclawToken,
@@ -420,6 +470,14 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
   emit('openclaw_connected', { url: args.openclawUrl })
   human(`${green('✓')} openclaw connected ${dim(`(${args.openclawUrl})`)}`)
 
+  // Re-emit on every subsequent reconnect so JSON-event consumers can
+  // see health flip back to healthy after a transient disconnect (e.g.
+  // openclaw restart, network blip).
+  openclaw.onReconnect(() => {
+    emit('openclaw_connected', { url: args.openclawUrl, reconnect: true })
+    human(`${green('✓')} openclaw reconnected ${dim(`(${args.openclawUrl})`)}`)
+  })
+
   // Wait for the *first* Sophon WS open before printing [ready], so
   // both humans and agents see a single deterministic milestone after
   // which the bridge is actually serving traffic.
@@ -429,7 +487,14 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
   })
 
   let firstReadyFired = false
-  const sophon = new SophonClient({
+  // Per-session symmetric key store — bridge generates session_keys
+  // for sessions it owns and accepts grants from sibling iOS devices.
+  // Loaded from disk before the first WS connect so reconnects pick
+  // up persisted keys without re-grant.
+  const sessionKeyStore = new SessionKeyStore()
+  await sessionKeyStore.load()
+
+  const sophon: SophonClient = new SophonClient({
     baseUrl: args.sophonBase,
     botToken: args.sophonToken,
     log,
@@ -438,15 +503,59 @@ async function runOpenclaw(ctx: ConnectorContext): Promise<void> {
       firstReadyFired = true
       firstSophonOpen()
     },
-    ...(installKey ? { installKey } : {}),
+    sessionKeyStore,
   })
-  const bridge = new Bridge({
+  const bridge: Bridge = new Bridge({
     sophon,
     openclaw,
     log,
     debugStream: args.debugStream,
-    ...(installKey ? { installKey } : {}),
+    sessionKeyStore,
   })
+
+  // Persist freshly-minted bridge keypair from a legacy-credentials
+  // upgrade. Done AFTER SophonClient/Bridge construction so a save
+  // failure doesn't block the connect — server-side device row gets
+  // populated via POST /v1/bridge/devices regardless.
+  if (bridgeSecretJustGenerated && bridgeSecretKey && bridgePubkeyHex && args.sophonToken) {
+    void saveCredentials({
+      botToken: args.sophonToken,
+      installationId,
+      sophonBase: args.sophonBase,
+      bridgeSecretHex: Buffer.from(bridgeSecretKey).toString('hex'),
+      bridgePubkeyHex,
+    })
+  }
+
+  // Register this bridge as a `devices` row right after the WS opens
+  // so siblings see us. Idempotent server-side; safe to call on every
+  // reconnect. We retry a couple of times with backoff because the
+  // network can flap during the WS handshake; subsequent connects re-
+  // run this anyway, so a single failure isn't fatal.
+  if (bridgeSecretKey && bridgePubkeyHex) {
+    const onceConnected = async () => {
+      let lastErr: unknown = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const { deviceId, pubkeyChanged } = await sophon.registerBridgeDevice({
+            pubkeyHex: bridgePubkeyHex!,
+            label: args.hostLabel,
+          })
+          bridge.setBridgeIdentity(deviceId, bridgeSecretKey!)
+          if (pubkeyChanged) {
+            log(`[bridge] device pubkey rotated server-side — old wrappers dropped`)
+          }
+          log(`[bridge] registered as device ${deviceId}`)
+          return
+        } catch (err) {
+          lastErr = err
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)))
+        }
+      }
+      log(`[bridge] device registration failed after retries: ${(lastErr as Error)?.message}`)
+    }
+    void sophonReady.then(() => void onceConnected())
+  }
   if (args.debugStream) {
     process.stderr.write(`${dim('debug-stream: ON — per-token telemetry will print to stderr')}\n`)
   }

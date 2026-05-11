@@ -13,16 +13,26 @@
 import { WebSocket } from 'ws'
 import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { deriveBlobKey, encryptSymmetric } from './crypto.js'
+import type { SessionKeyStore } from './session-keys.js'
 
-/** Bridge package version. Track package.json — server captures this
- *  via the post-open `hello` frame and stores it on installations.row
- *  so iOS can gate viewer affordances by capability (file viewer
- *  requires >= 0.6.0; e2e message-text in 0.7.0; tasks + approvals
- *  e2e in 0.8.0; Phase 4b cutover — plaintext-write paths removed —
- *  in 0.9.0). */
-const BRIDGE_VERSION = '0.9.0'
+/** Bridge package version reported in the hello-frame and persisted to
+ *  `installations.bridge_version`. Read from package.json so a forgotten
+ *  manual bump can't drift from the published version (caught us once on
+ *  0.13.0 where this was hard-coded to '0.12.0'). */
+const BRIDGE_VERSION: string = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 
 export interface SophonUpdate {
   update_id: string
@@ -42,12 +52,10 @@ export interface SophonClientOpts {
    *  flip a "we're talking to Sophon" indicator. Called for every
    *  reconnect, not just the first — caller dedupes if needed. */
   onConnected?: () => void
-  /** 32-byte e2e install key from credentials.json. When set, the
-   *  client encrypts outbound wire fields (message text, tool args,
-   *  file paths) per docs/ENCRYPTION_PLAN.md §3. Phase 3.1 just
-   *  threads the key through; field-by-field wiring follows in
-   *  later phases. */
-  installKey?: Uint8Array
+  /** Per-session symmetric key store. Bridge generates session_keys
+   *  for sessions it owns, accepts grants from siblings, and
+   *  fans-out wraps when new devices join. */
+  sessionKeyStore: SessionKeyStore
 }
 
 export class SophonClient {
@@ -57,6 +65,17 @@ export class SophonClient {
   private readonly maxReconnectMs = 30_000
   private stopped = false
   private updateHandler: ((u: SophonUpdate) => Promise<void>) | null = null
+  /** update_id dedupe ring. The cloud fans every `session.message` to
+   *  one WS subscription per bridge connection — but zombie subscriptions
+   *  (from a prior process that crashed or was kickstarted before its
+   *  ws.close propagated to the server) can leave 2+ listeners on the
+   *  same installation, causing duplicate handler runs. The reconnect
+   *  loop also replays unack'd updates, which we ACK immediately on
+   *  receipt — but a race between ack and replay can briefly double up.
+   *  Either way, idempotent processing here is cheaper than chasing the
+   *  cloud-side fanout state machine. */
+  private seenUpdateIds = new Set<string>()
+  private static readonly SEEN_UPDATE_CAP = 1024
   /** Server → bridge RPC handler. Any frame with `req_id` (other than
    *  the well-known envelope types like `update`/`ping`/`pong`) is
    *  dispatched here. The handler returns the reply payload; the
@@ -67,23 +86,13 @@ export class SophonClient {
     | null = null
   private log: (line: string) => void
   private onConnected?: () => void
-  /** When non-null, the client encrypts wire fields. Visible to
-   *  outbound RPC methods so each can decide whether to wrap in
-   *  ciphertext or pass through as plaintext (legacy mode). */
-  protected installKey: Uint8Array | null
+  protected sessionKeyStore: SessionKeyStore
 
   constructor(opts: SophonClientOpts) {
     this.opts = opts
     this.log = opts.log ?? (() => {})
     this.onConnected = opts.onConnected
-    this.installKey = opts.installKey ?? null
-  }
-
-  /** True iff this client has an install_key and will encrypt wire
-   *  fields. Bridge code branches on this to decide whether new
-   *  ciphertext fields go on the request or stay legacy plaintext. */
-  hasInstallKey(): boolean {
-    return this.installKey !== null
+    this.sessionKeyStore = opts.sessionKeyStore
   }
 
   onUpdate(handler: (u: SophonUpdate) => Promise<void>): void {
@@ -246,6 +255,28 @@ export class SophonClient {
           // placeholder, possibly some deltas). On reconnect the agent
           // skips the un-replayed update.
           ws.send(JSON.stringify({ type: 'ack', up_to_update_id: update.update_id }))
+          // Dedupe by update_id. Two paths can fan the same update twice:
+          // (1) zombie subscriptions on the cloud — a prior bridge ws
+          //     conn that didn't fully close left its listener attached,
+          //     so the fanout writes to two listeners on the same install.
+          // (2) reconnect-replay race — we ACK on receipt, but if reconnect
+          //     fires before the ack lands, the watcher replays the row.
+          // Either way, double-handling produces a "[OpenClaw error] not
+          // connected" bubble alongside the real reply, because handler #2
+          // races handler #1's chat.send and one of them loses on the WS.
+          if (update.update_id) {
+            if (this.seenUpdateIds.has(update.update_id)) {
+              this.log(`[sophon] duplicate update ${update.update_id} type=${update.type} — dropped`)
+              return
+            }
+            this.seenUpdateIds.add(update.update_id)
+            // Bound the set; oldest entries fall off naturally on overflow
+            // (rough FIFO: Sets iterate in insertion order).
+            if (this.seenUpdateIds.size > SophonClient.SEEN_UPDATE_CAP) {
+              const first = this.seenUpdateIds.values().next().value
+              if (first !== undefined) this.seenUpdateIds.delete(first)
+            }
+          }
           ;(async () => {
             try {
               if (this.updateHandler) await this.updateHandler(update)
@@ -284,57 +315,118 @@ export class SophonClient {
     return data as Record<string, unknown>
   }
 
-  /** Per-session blob_key for messages. Each session gets its own
-   *  AES key derived from install_key + HKDF info
-   *  `messages/<session_id>`. Per-session (not per-message) because
-   *  deltas accumulate to the same logical bubble and the bridge
-   *  doesn't know `message_id` before calling
-   *  `startStreamingMessage`. iOS uses the same path on read. Throws
-   *  when there's no install_key — post-cutover the bridge MUST be
-   *  paired e2e to send anything. */
-  protected messagesBlobKey(sessionId: string): Uint8Array {
-    if (!this.installKey) {
-      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
-    }
-    return deriveBlobKey(this.installKey, `messages/${sessionId}`)
+  /** Per-session blob_key for messages. Derived from this session's
+   *  `session_key` (held in `SessionKeyStore`) + HKDF info
+   *  `messages/<session_id>`. iOS uses the same path on read.
+   *  Auto-creates a fresh session_key for sessions the bridge owns
+   *  but hasn't seen yet (cron-driven runs, /clear that rotates).
+   *  Caller is responsible for fanning the new key out via
+   *  POST /v1/bridge/sessions/:id/recipients before downstream reads. */
+  protected async messagesBlobKey(sessionId: string): Promise<Uint8Array> {
+    const sessionKey = await this.sessionKeyStore.getOrCreate(sessionId)
+    return deriveBlobKey(sessionKey, `messages/${sessionId}`)
   }
 
   /** AES-GCM-encrypt UTF-8 text under the per-session messages
-   *  blob_key. Returns base64 of the versioned envelope. Throws when
-   *  install_key is missing. */
-  protected encryptMessageText(sessionId: string, text: string): string {
-    const key = this.messagesBlobKey(sessionId)
+   *  blob_key. Returns base64 of the versioned envelope. */
+  protected async encryptMessageText(sessionId: string, text: string): Promise<string> {
+    const key = await this.messagesBlobKey(sessionId)
     const env = encryptSymmetric(new TextEncoder().encode(text), key)
     return Buffer.from(env).toString('base64')
   }
 
-  /** Per-session blob_key for tasks. Same shape as
-   *  `messagesBlobKey` — fine-grained per-task derivation isn't
-   *  worth the complexity for v1 since tasks are read in batches
-   *  anyway. Throws when no install_key. */
-  protected tasksBlobKey(sessionId: string): Uint8Array {
-    if (!this.installKey) {
-      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
-    }
-    return deriveBlobKey(this.installKey, `tasks/${sessionId}`)
+  /** Per-session blob_key for tasks. Same shape as `messagesBlobKey`. */
+  protected async tasksBlobKey(sessionId: string): Promise<Uint8Array> {
+    const sessionKey = await this.sessionKeyStore.getOrCreate(sessionId)
+    return deriveBlobKey(sessionKey, `tasks/${sessionId}`)
   }
 
-  /** Encrypt an arbitrary JSON-shaped value (input/partial_result/
-   *  result) under the tasks blob_key. The plaintext is the
-   *  JSON-stringified payload; iOS parses on decrypt. */
-  protected encryptTaskJson(sessionId: string, value: unknown): string {
-    const key = this.tasksBlobKey(sessionId)
+  /** Encrypt an arbitrary JSON-shaped value under the tasks blob_key. */
+  protected async encryptTaskJson(sessionId: string, value: unknown): Promise<string> {
+    const key = await this.tasksBlobKey(sessionId)
     const json = JSON.stringify(value ?? null)
     const env = encryptSymmetric(new TextEncoder().encode(json), key)
     return Buffer.from(env).toString('base64')
   }
 
-  /** Encrypt a small text field (status_label / error) under the
-   *  tasks blob_key. */
-  protected encryptTaskText(sessionId: string, text: string): string {
-    const key = this.tasksBlobKey(sessionId)
+  /** Encrypt a small text field (status_label / error) under tasks blob_key. */
+  protected async encryptTaskText(sessionId: string, text: string): Promise<string> {
+    const key = await this.tasksBlobKey(sessionId)
     const env = encryptSymmetric(new TextEncoder().encode(text), key)
     return Buffer.from(env).toString('base64')
+  }
+
+  /** Register or refresh this bridge's `devices` row on the server.
+   *  Called on every connect; idempotent server-side. The pubkey
+   *  becomes the long-term identity siblings encrypt session_keys
+   *  for. Returns the assigned device_id. */
+  async registerBridgeDevice(input: {
+    pubkeyHex: string
+    label?: string
+  }): Promise<{ deviceId: string; pubkeyChanged: boolean }> {
+    const data = await this.post('/v1/bridge/devices', {
+      pubkey: input.pubkeyHex,
+      ...(input.label ? { label: input.label } : {}),
+    })
+    const result = (data as { result?: { device_id: string; pubkey_changed?: boolean } }).result
+    if (!result || !result.device_id) {
+      throw new Error('register bridge device: missing device_id in response')
+    }
+    return {
+      deviceId: result.device_id,
+      pubkeyChanged: Boolean(result.pubkey_changed),
+    }
+  }
+
+  /** Bulk-grant wrapped session_keys to one or more recipient devices
+   *  for a session this bridge owns. Caller has already done the
+   *  sealed-box wrap under each device's pubkey; this is a thin
+   *  HTTP shim. */
+  async postBridgeSessionRecipients(input: {
+    sessionId: string
+    recipients: Array<{ deviceId: string; wrappedSessionKeyB64: string }>
+    wrappedByDeviceId?: string
+  }): Promise<void> {
+    await this.post(`/v1/bridge/sessions/${input.sessionId}/recipients`, {
+      recipients: input.recipients.map((r) => ({
+        device_id: r.deviceId,
+        wrapped_session_key: r.wrappedSessionKeyB64,
+      })),
+      ...(input.wrappedByDeviceId ? { wrapped_by_device_id: input.wrappedByDeviceId } : {}),
+    })
+  }
+
+  /** Spawn a new chat session owned by THIS bridge installation.
+   *
+   *  Used for cron-initiated runs: OpenClaw fires the routine on its
+   *  own schedule, with no user-side interaction beforehand, so the
+   *  bridge needs to mint a Sophon session on demand to host the
+   *  transcript + approvals. iOS sees the new session via the
+   *  `session_created` SSE event the same way it does for chats the
+   *  user creates.
+   *
+   *  The title (when given) is encrypted under the per-session blob_key
+   *  derived against the new session_id — same path iOS uses for
+   *  title decoding (`session_meta/<session_id>`).
+   */
+  async createSession(input: {
+    title?: string
+    source?: string
+  }): Promise<{ sessionId: string }> {
+    // Mint id locally so we can encrypt the title against it before
+    // POST. Server ignores anything we send beyond title_ct + source.
+    const data = await this.post('/v1/bridge/createSession', {
+      ...(input.source ? { source: input.source } : {}),
+      // Title encryption requires knowing the session id ahead of time;
+      // the server-side endpoint mints its own id, so we either accept a
+      // round-trip without a title or skip the title for the very first
+      // call. We keep it simple: omit title_ct on the create, optionally
+      // PATCH-rename later (out of scope for v1 — display falls back to
+      // the routine name in iOS routine surfaces).
+    })
+    const result = (data.result ?? {}) as { session_id?: string }
+    if (!result.session_id) throw new Error('createSession returned no session_id')
+    return { sessionId: result.session_id }
   }
 
   /** Atomic non-streaming reply. */
@@ -343,9 +435,10 @@ export class SophonClient {
     text: string
     interactionId?: string | null
   }): Promise<{ messageId: string }> {
+    const textCt = await this.encryptMessageText(input.sessionId, input.text)
     const data = await this.post('/v1/bridge/sendMessage', {
       session_id: input.sessionId,
-      text_ct: this.encryptMessageText(input.sessionId, input.text),
+      text_ct: textCt,
       idempotency_key: randomUUID(),
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
     })
@@ -360,9 +453,10 @@ export class SophonClient {
     sessionId: string
     interactionId?: string | null
   }): Promise<{ messageId: string }> {
+    const textCt = await this.encryptMessageText(input.sessionId, '')
     const data = await this.post('/v1/bridge/sendMessage', {
       session_id: input.sessionId,
-      text_ct: this.encryptMessageText(input.sessionId, ''),
+      text_ct: textCt,
       idempotency_key: randomUUID(),
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
     })
@@ -370,18 +464,16 @@ export class SophonClient {
     return { messageId: result.message_id ?? '' }
   }
 
-  /** Append a streaming chunk. The delta is independently encrypted
-   *  under the same session blob_key — server forwards over SSE
-   *  without ever touching plaintext. iOS decrypts each delta as it
-   *  arrives and appends to the bubble. */
+  /** Append a streaming chunk. */
   async sendDelta(input: {
     messageId: string
     sessionId: string
     delta: string
   }): Promise<void> {
+    const deltaCt = await this.encryptMessageText(input.sessionId, input.delta)
     await this.post('/v1/bridge/sendMessageDelta', {
       message_id: input.messageId,
-      delta_ct: this.encryptMessageText(input.sessionId, input.delta),
+      delta_ct: deltaCt,
       idempotency_key: randomUUID(),
     })
   }
@@ -393,7 +485,7 @@ export class SophonClient {
     usage?: Record<string, unknown>
   }): Promise<void> {
     const textCt = input.text !== undefined
-      ? this.encryptMessageText(input.sessionId, input.text)
+      ? await this.encryptMessageText(input.sessionId, input.text)
       : null
     await this.post('/v1/bridge/sendMessageEnd', {
       message_id: input.messageId,
@@ -415,21 +507,19 @@ export class SophonClient {
     statusLabel?: string
     args?: unknown
   }): Promise<void> {
-    // E2E: encrypt content-bearing fields (status_label, args) under
-    // the per-session tasks blob_key. `kind` stays plaintext — it's
-    // a tool-name enum (Read/Edit/Bash/...) used by the iOS deck for
-    // icon/color routing and is not user content.
+    const statusLabelCt = input.statusLabel !== undefined
+      ? await this.encryptTaskText(input.sessionId, input.statusLabel)
+      : null
+    const argsCt = input.args !== undefined
+      ? await this.encryptTaskJson(input.sessionId, input.args)
+      : null
     await this.post('/v1/bridge/createTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
       kind: input.kind,
-      ...(input.statusLabel
-        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
-        : {}),
-      ...(input.args !== undefined
-        ? { args_ct: this.encryptTaskJson(input.sessionId, input.args) }
-        : {}),
+      ...(statusLabelCt ? { status_label_ct: statusLabelCt } : {}),
+      ...(argsCt ? { args_ct: argsCt } : {}),
       idempotency_key: `task:create:${input.taskId}`,
     })
   }
@@ -442,17 +532,19 @@ export class SophonClient {
     progressPercent?: number
     partialResult?: unknown
   }): Promise<void> {
+    const statusLabelCt = input.statusLabel !== undefined
+      ? await this.encryptTaskText(input.sessionId, input.statusLabel)
+      : null
+    const partialResultCt = input.partialResult !== undefined
+      ? await this.encryptTaskJson(input.sessionId, input.partialResult)
+      : null
     await this.post('/v1/bridge/updateTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
-      ...(input.statusLabel
-        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
-        : {}),
+      ...(statusLabelCt ? { status_label_ct: statusLabelCt } : {}),
       ...(input.progressPercent !== undefined ? { progress_percent: input.progressPercent } : {}),
-      ...(input.partialResult !== undefined
-        ? { partial_result_ct: this.encryptTaskJson(input.sessionId, input.partialResult) }
-        : {}),
+      ...(partialResultCt ? { partial_result_ct: partialResultCt } : {}),
       idempotency_key: `task:update:${input.taskId}:${randomUUID()}`,
     })
   }
@@ -467,21 +559,24 @@ export class SophonClient {
     error?: string
     result?: unknown
   }): Promise<void> {
+    const statusLabelCt = input.statusLabel !== undefined
+      ? await this.encryptTaskText(input.sessionId, input.statusLabel)
+      : null
+    const errorCt = input.error !== undefined
+      ? await this.encryptTaskText(input.sessionId, input.error)
+      : null
+    const resultCt = input.result !== undefined
+      ? await this.encryptTaskJson(input.sessionId, input.result)
+      : null
     await this.post('/v1/bridge/finishTask', {
       session_id: input.sessionId,
       ...(input.interactionId ? { interaction_id: input.interactionId } : {}),
       task_id: input.taskId,
       ...(input.name ? { name: input.name } : {}),
       status: input.status,
-      ...(input.statusLabel
-        ? { status_label_ct: this.encryptTaskText(input.sessionId, input.statusLabel) }
-        : {}),
-      ...(input.error
-        ? { error_ct: this.encryptTaskText(input.sessionId, input.error) }
-        : {}),
-      ...(input.result !== undefined
-        ? { result_ct: this.encryptTaskJson(input.sessionId, input.result) }
-        : {}),
+      ...(statusLabelCt ? { status_label_ct: statusLabelCt } : {}),
+      ...(errorCt ? { error_ct: errorCt } : {}),
+      ...(resultCt ? { result_ct: resultCt } : {}),
       idempotency_key: `task:finish:${input.taskId}:${input.status}`,
     })
   }
@@ -547,13 +642,10 @@ export class SophonClient {
     host?: string
     message: string
   }): Promise<void> {
-    // Encrypt the full details payload under per-session approvals
-    // blob_key. iOS decrypts on the SSE event. Throws when no
-    // install_key (post-cutover the bridge MUST be e2e).
-    if (!this.installKey) {
-      throw new Error('install_key required: bridge must be re-paired (Phase 4b cutover)')
-    }
-    const blobKey = deriveBlobKey(this.installKey, `approvals/${input.sessionId}`)
+    // Encrypt the full details payload under the per-session approvals
+    // blob_key, derived from this session's session_key.
+    const sessionKey = await this.sessionKeyStore.getOrCreate(input.sessionId)
+    const blobKey = deriveBlobKey(sessionKey, `approvals/${input.sessionId}`)
     const details = {
       title: input.title,
       message: input.message,

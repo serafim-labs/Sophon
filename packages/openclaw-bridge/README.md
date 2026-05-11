@@ -4,6 +4,16 @@ One CLI to connect local agents to [Sophon](https://sophon.at). Each subcommand 
 
 ## Quick start
 
+One command — installs the package, drives pairing, registers a LaunchAgent so the bridge survives terminal close / logout / reboot:
+
+```sh
+sh -c "$(curl -fsSL https://sophon.at/install)"
+```
+
+The installer script ([source](./install.sh)) checks macOS + Node 20+, runs `npm install -g @sophonai/bridge@latest`, then hands off to `bridge service install`. Read before piping into sh: `curl -fsSL https://sophon.at/install`.
+
+If you'd rather drive it manually (Node-friendly, no curl|sh):
+
 ```sh
 npx @sophonai/bridge openclaw
 ```
@@ -36,6 +46,34 @@ npx @sophonai/bridge openclaw    # now bridges to Sophon
 
 We don't auto-run `openclaw start` because it spawns a long-lived process best owned by the user.
 
+### Run as a service — close the terminal
+
+By default `bridge openclaw` lives in your foreground shell; close the terminal and the bridge dies. To run it in the background under macOS launchd (so iOS keeps reaching your Mac across logout / restart / crashes):
+
+```sh
+npm install -g @sophonai/bridge          # so the LaunchAgent has a stable path
+bridge service install                   # pairs (if needed) → writes plist → bootstraps → starts
+bridge service status                    # loaded? running? last exit?
+```
+
+`service install` is the one-shot command: if you haven't paired yet, it drops into the interactive flow (browser opens, claim on iPhone) first; if you have, it skips straight to registering the LaunchAgent. After it exits the terminal can close.
+
+The plist sets `RunAtLoad=true` + `KeepAlive=true` (same shape OpenClaw uses for its gateway), so launchd respawns the process if it crashes and starts it on login. After that the terminal can close.
+
+| Command | What it does |
+|---|---|
+| `bridge service install [--force]` | Write the plist and `launchctl bootstrap` it into `gui/<uid>` |
+| `bridge service uninstall` | `launchctl bootout` and move the plist to `~/.Trash` |
+| `bridge service status` | Parse `launchctl print` — loaded, running, pid, last exit code |
+| `bridge service restart` | `launchctl kickstart -k` (force-restart the live unit) |
+| `bridge service logs [-f] [-n N]` | Print log paths or `tail -F` them |
+
+Logs go to `~/Library/Logs/sophon-bridge/{out,err}.log`. Pass-through env vars at install time (`SOPHON_BASE_URL`, `SOPHON_HOST_LABEL`, `SOPHON_CONFIG_DIR`, `OPENCLAW_URL`, `OPENCLAW_TOKEN`, `OPENCLAW_STATE_DIR`, `SOPHON_DEBUG_STREAM`, `NO_COLOR`) are baked into `EnvironmentVariables`. Reinstall with `--force` after upgrading the package or changing env.
+
+The service install refuses to pin to an `npx` cache path (those get pruned and break silently). If you'd rather pair separately first, `bridge openclaw --pair-only` does just the pairing and exits.
+
+> macOS only for now. Linux (`systemd --user`) and Windows (Task Scheduler) land later.
+
 ### Headless / SSH
 
 ```sh
@@ -49,6 +87,7 @@ Prints a 7-letter code to claim from the Sophon iOS app. The CLI auto-falls-back
 | Command | Purpose |
 |---|---|
 | `openclaw` | Bridge a local OpenClaw gateway through Sophon |
+| `service <cmd>` | Run the bridge under macOS launchd (`install`/`uninstall`/`status`/`restart`/`logs`) |
 | `doctor [connector]` | Preflight checklist — checks binary, gateway, token, WS reachability, Sophon API, saved credentials |
 | `status` | Print where credentials live + which installation is paired |
 | `--version` | Print package version |
@@ -145,6 +184,7 @@ $ npx @sophonai/bridge --json openclaw --yes
 | `pairing_browser_opened` | system browser launched | `browser_url` |
 | `pairing_waiting` | every 15 s while polling | `elapsed_sec`, `remaining_sec` |
 | `pairing_claimed` | iOS app accepted the code | `installation_id` |
+| `paired_only` | `--pair-only` exiting after save | `installation_id`, `credentials_file`, `already_paired` |
 | `openclaw_connected` | local WS handshake done | `url` |
 | `sophon_connected` | first Sophon WS open | `base_url` |
 | `ready` | both sides connected | `sophon_base`, `openclaw_url`, `installation_id` |
@@ -153,6 +193,13 @@ $ npx @sophonai/bridge --json openclaw --yes
 | `doctor_check` | one per `doctor` check | `name`, `status`, `detail`, `hint` |
 | `doctor_summary` | end of `doctor` | `ok`, `pass`, `fail`, `warn`, `info` |
 | `status` | `status` subcommand | `credentials_file`, `sophon_base`, `paired`, `installation_id`, `paired_at` |
+| `service_installed` | `service install` succeeded | `label`, `plist_path`, `stdout_path`, `stderr_path`, `loaded`, `pid` |
+| `service_install_noop` | already installed (no `--force`) | `result`, `label`, `plist_path`, `pid` |
+| `service_uninstalled` | `service uninstall` succeeded | `plist_path`, `moved_to_trash` |
+| `service_uninstall_noop` | nothing to uninstall | `plist_path` |
+| `service_status` | `service status` snapshot | `installed`, `loaded`, `running`, `pid`, `state`, `last_exit_code`, `last_exit_reason`, `plist_path`, `stdout_path`, `stderr_path` |
+| `service_restarted` | `service restart` succeeded | `pid`, `state` |
+| `service_logs` | `service logs` (no `-f`) | `stdout_path`, `stderr_path`, `stdout_size`, `stderr_size` |
 | `help` | `--help` in JSON mode | `package`, `connectors[]`, `global_*` |
 | `version` | `--version` in JSON mode | `version` |
 

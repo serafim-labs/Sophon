@@ -35,6 +35,7 @@ export type EventName =
   | 'pairing_browser_opened'
   | 'pairing_waiting'
   | 'pairing_claimed'
+  | 'paired_only'
   | 'pairing_e2e_sas'
   | 'pairing_expired'
   | 'pairing_timeout'
@@ -46,6 +47,13 @@ export type EventName =
   | 'doctor_check'
   | 'doctor_summary'
   | 'status'
+  | 'service_installed'
+  | 'service_install_noop'
+  | 'service_uninstalled'
+  | 'service_uninstall_noop'
+  | 'service_status'
+  | 'service_restarted'
+  | 'service_logs'
 
 export function emit(event: EventName, payload: Record<string, unknown> = {}): void {
   if (!jsonMode) return

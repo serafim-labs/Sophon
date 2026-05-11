@@ -26,6 +26,7 @@ import {
   BLIND_INDEX_BYTES,
   MalformedEnvelopeError,
   NULL_SENTINEL,
+  SEALED_BOX_VERSION_V1,
   SYMM_VERSION_V1,
   UnsupportedVersionError,
   X25519_KEY_BYTES,
@@ -37,6 +38,8 @@ import {
   deriveSASFromECDH,
   encryptSymmetric,
   generateKeypair,
+  sealedBoxDecrypt,
+  sealedBoxEncrypt,
 } from './crypto'
 
 // ─── Fixed test inputs (mirrored verbatim in SophonCryptoTests.swift) ─
@@ -242,6 +245,84 @@ describe('deriveInstallKeyFromECDH + deriveSASFromECDH', () => {
     const a = deriveInstallKeyFromECDH(k1.secretKey, k2.publicKey)
     const b = deriveInstallKeyFromECDH(k1.secretKey, k3.publicKey)
     expect(toHex(a)).not.toBe(toHex(b))
+  })
+})
+
+// ─── Sealed-box (anonymous-recipient ECIES) ─────────────────────────
+//
+// Round-trip + cross-format properties. Random ephemeral keypair per
+// encrypt → no pinned-hex vector for the envelope as a whole. Pin the
+// version byte and the ephemeral pubkey slice length so the wire
+// format can't drift accidentally.
+
+describe('sealedBoxEncrypt/sealedBoxDecrypt', () => {
+  it('round-trips through a recipient keypair', () => {
+    const recipient = generateKeypair()
+    const payload = new TextEncoder().encode('hello sealed-box, recipient-only')
+    const env = sealedBoxEncrypt(payload, recipient.publicKey)
+    const out = sealedBoxDecrypt(env, recipient.secretKey)
+    expect(out).not.toBeNull()
+    expect(new TextDecoder().decode(out!)).toBe('hello sealed-box, recipient-only')
+  })
+
+  it('produces the v1 wire layout: [0x02][eph_pub 32][inner envelope]', () => {
+    const recipient = generateKeypair()
+    const env = sealedBoxEncrypt(new Uint8Array([1, 2, 3]), recipient.publicKey)
+    expect(env[0]).toBe(SEALED_BOX_VERSION_V1)
+    // version + 32 eph_pub + at least the inner version byte.
+    expect(env.length).toBeGreaterThan(1 + X25519_KEY_BYTES + 1)
+    // Inner envelope starts with the symmetric version byte.
+    expect(env[1 + X25519_KEY_BYTES]).toBe(SYMM_VERSION_V1)
+  })
+
+  it('returns null for the wrong recipient (timing-uniform AEAD failure)', () => {
+    const real = generateKeypair()
+    const wrong = generateKeypair()
+    const env = sealedBoxEncrypt(new TextEncoder().encode('secret'), real.publicKey)
+    const out = sealedBoxDecrypt(env, wrong.secretKey)
+    expect(out).toBeNull()
+  })
+
+  it('round-trips a 32-byte session_key (the canonical sophon use)', () => {
+    const recipient = generateKeypair()
+    const sessionKey = new Uint8Array(AES_KEY_BYTES)
+    for (let i = 0; i < AES_KEY_BYTES; i++) sessionKey[i] = (i * 7 + 11) & 0xff
+    const env = sealedBoxEncrypt(sessionKey, recipient.publicKey)
+    const out = sealedBoxDecrypt(env, recipient.secretKey)
+    expect(out).not.toBeNull()
+    expect(out!.length).toBe(AES_KEY_BYTES)
+    expect(Buffer.from(out!).equals(Buffer.from(sessionKey))).toBe(true)
+  })
+
+  it('different recipients yield different envelopes (ephemeral keypair per call)', () => {
+    const r1 = generateKeypair()
+    const r2 = generateKeypair()
+    const payload = new Uint8Array([0xaa, 0xbb])
+    const e1 = sealedBoxEncrypt(payload, r1.publicKey)
+    const e2 = sealedBoxEncrypt(payload, r2.publicKey)
+    expect(toHex(e1)).not.toBe(toHex(e2))
+  })
+
+  it('two encrypts under the same recipient still differ (fresh ephemeral)', () => {
+    const r = generateKeypair()
+    const payload = new Uint8Array([0xaa, 0xbb])
+    const a = sealedBoxEncrypt(payload, r.publicKey)
+    const b = sealedBoxEncrypt(payload, r.publicKey)
+    expect(toHex(a)).not.toBe(toHex(b))
+  })
+
+  it('rejects a wrong-version envelope', () => {
+    const r = generateKeypair()
+    const env = sealedBoxEncrypt(new Uint8Array([1]), r.publicKey)
+    env[0] = 0x99
+    expect(() => sealedBoxDecrypt(env, r.secretKey)).toThrow(UnsupportedVersionError)
+  })
+
+  it('rejects a too-short envelope', () => {
+    const r = generateKeypair()
+    expect(() => sealedBoxDecrypt(new Uint8Array([SEALED_BOX_VERSION_V1, 0, 0]), r.secretKey)).toThrow(
+      MalformedEnvelopeError,
+    )
   })
 })
 

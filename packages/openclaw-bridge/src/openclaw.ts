@@ -19,6 +19,25 @@
 import { WebSocket } from 'ws'
 import { randomUUID } from 'node:crypto'
 
+/**
+ * Range of OpenClaw gateway protocol versions this bridge understands.
+ *
+ * OpenClaw bumped `PROTOCOL_VERSION` from 3 → 4 around the 5.5/5.6
+ * release (5.7 briefly went back to 3 due to a botched build, then
+ * 5.9-beta.1+ landed firmly on 4). The `ConnectParamsSchema` payload
+ * is identical between v3 and v4 — only the version-number gate
+ * moved — so we declare the union range and let the gateway pick.
+ *
+ * If a future gateway requires a version outside this band, the
+ * handshake response surfaces `details.expectedProtocol` (see the
+ * "connect failed" branch in the message handler), and the error
+ * message tells the user exactly which version to install. Keep the
+ * constants in sync with the actual `ConnectParamsSchema` shape if
+ * the gateway ever adds required fields per protocol bump.
+ */
+export const OPENCLAW_MIN_PROTOCOL = 3
+export const OPENCLAW_MAX_PROTOCOL = 4
+
 export interface OpenClawClientOpts {
   url: string // ws://localhost:8089
   token: string
@@ -71,6 +90,26 @@ interface PendingResponse {
   reject: (err: Error) => void
 }
 
+/// Payload shape for an `event: 'cron'` frame from OpenClaw. Most
+/// fields are optional because the gateway emits this event for several
+/// transitions (started, progress, finished, error) and they don't all
+/// carry the same metadata.
+export interface CronEventPayload {
+  runId?: string
+  jobId?: string
+  jobName?: string
+  /** Internal OpenClaw session id for the run (UUID). Distinct from
+   *  any Sophon session id the bridge may mint to host the transcript. */
+  sessionId?: string
+  state?: string
+  status?: string
+  [key: string]: unknown
+}
+
+/** Reconnect-loop backoff bounds (close handler in OpenClawClient). */
+const RECONNECT_MIN_MS = 500
+const RECONNECT_MAX_MS = 30_000
+
 export class OpenClawClient {
   private opts: OpenClawClientOpts
   private ws: WebSocket | null = null
@@ -79,6 +118,7 @@ export class OpenClawClient {
   private pending = new Map<string, PendingResponse>()
   private streamHandlers = new Map<string, AgentStreamHandlers>() // runId → handlers
   private streamCumulative = new Map<string, string>() // runId → cumulative text
+  private cronEventHandlers: Array<(payload: CronEventPayload) => void> = []
   private sessionRunIds = new Map<string, string>() // sessionKey → active runId
   // Run-ids whose lifecycle:end carried `replayInvalid: true` — async
   // approval pause. We keep their handlers + cumulative text alive so
@@ -91,6 +131,25 @@ export class OpenClawClient {
   // `stream:'item' kind:'command'` (exec wrapper) at the same
   // toolCallId.
   private toolPhasesSeen = new Map<string, Set<string>>()
+
+  /// Subscribe to OpenClaw cron events. Each callback receives the raw
+  /// payload (state/runId/jobId/sessionId/...). Returns an unsubscribe
+  /// function. Used by the bridge to detect cron runs and lazily mint
+  /// a Sophon session that hosts the transcript + approvals.
+  onCronEvent(handler: (payload: CronEventPayload) => void): () => void {
+    this.cronEventHandlers.push(handler)
+    return () => {
+      this.cronEventHandlers = this.cronEventHandlers.filter((h) => h !== handler)
+    }
+  }
+
+  /// External hook to inject stream handlers for a known runId. The
+  /// bridge calls this after registering on a cron event so subsequent
+  /// `chat`, `agent`, `tool`, `approval` frames for that runId fan out
+  /// through the same machinery user-initiated `chat.send` uses.
+  registerStreamHandlers(runId: string, handlers: AgentStreamHandlers): void {
+    this.streamHandlers.set(runId, handlers)
+  }
 
   private cleanupRun(runId: string): void {
     this.streamHandlers.delete(runId)
@@ -127,10 +186,24 @@ export class OpenClawClient {
   }
   private log: (line: string) => void
   private stopped = false
+  /** Exponential-backoff state for the close-handler reconnect loop.
+   *  Reset to RECONNECT_MIN_MS on every clean handshake. */
+  private reconnectMs = RECONNECT_MIN_MS
+  private reconnecting = false
+  /** Fires whenever the WS goes from disconnected → connected (re-)
+   *  established. Subscribers (the connector runner) use it to
+   *  re-emit `openclaw_connected` so health flips back to healthy. */
+  private reconnectListeners: Array<() => void> = []
 
   constructor(opts: OpenClawClientOpts) {
     this.opts = opts
     this.log = opts.log ?? (() => {})
+  }
+
+  /** Register a callback fired after every *re*-connect (not the first
+   *  one — that's `await connect()`'s return). */
+  onReconnect(handler: () => void): void {
+    this.reconnectListeners.push(handler)
   }
 
   async connect(): Promise<void> {
@@ -169,8 +242,13 @@ export class OpenClawClient {
             id: randomUUID(),
             method: 'connect',
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              // See OPENCLAW_{MIN,MAX}_PROTOCOL doc — we span the
+              // gateway's known PROTOCOL_VERSION values (3 and 4) so
+              // one binary works against any supported openclaw
+              // release. The error branch below reads the gateway's
+              // `expectedProtocol` if the next bump shifts the window.
+              minProtocol: OPENCLAW_MIN_PROTOCOL,
+              maxProtocol: OPENCLAW_MAX_PROTOCOL,
               client: {
                 id: 'gateway-client',
                 displayName: 'Sophon OpenClaw Bridge',
@@ -179,12 +257,15 @@ export class OpenClawClient {
                 mode: 'backend',
               },
               role: 'operator',
-              // operator.approvals is the scope the gateway gates
-              // exec.approval.resolve / plugin.approval.resolve on
-              // (W12 Phase 2). Without it the bridge can mirror
-              // approvals out to iOS but can't push the user's
-              // decision back into OpenClaw.
-              scopes: ['operator.read', 'operator.write', 'operator.approvals'],
+              // operator.approvals gates exec/plugin approval resolves;
+              // operator.admin gates sessions.patch (the model-selection
+              // surface). Bridge runs as gateway-client/backend over
+              // direct-local loopback with the operator token from
+              // ~/.openclaw/openclaw.json — that token already holds
+              // CLI_DEFAULT_OPERATOR_SCOPES (incl. admin), and the
+              // local-backend self-pair bypass preserves self-declared
+              // scopes for this exact client profile.
+              scopes: ['operator.read', 'operator.write', 'operator.approvals', 'operator.admin'],
               auth: this.deviceToken
                 ? { token: this.opts.token, deviceToken: this.deviceToken }
                 : { token: this.opts.token },
@@ -204,11 +285,40 @@ export class OpenClawClient {
             const payload = (frame.payload ?? {}) as { auth?: { deviceToken?: string } }
             this.deviceToken = payload.auth?.deviceToken ?? this.deviceToken
             this.connected = true
+            this.reconnectMs = RECONNECT_MIN_MS
             this.log('[openclaw] connected')
             resolve()
           } else {
-            const err = (frame.error ?? {}) as { code?: string; message?: string }
-            const msg = `connect failed: ${err.code ?? '?'} ${err.message ?? ''}`
+            // Surface server-provided details (gateway packs
+            // `expectedProtocol`, supported scopes, etc. into
+            // `error.details`). Without this all the user sees is
+            // "INVALID_REQUEST protocol mismatch" and has no idea
+            // which version of the connector to install.
+            const err = (frame.error ?? {}) as {
+              code?: string
+              message?: string
+              details?: Record<string, unknown>
+            }
+            const detailsRaw = err.details
+            const expected =
+              detailsRaw && typeof detailsRaw.expectedProtocol === 'number'
+                ? (detailsRaw.expectedProtocol as number)
+                : null
+            const parts = [`connect failed: ${err.code ?? '?'} ${err.message ?? ''}`]
+            if (expected !== null) {
+              // 3 / 4 are the only values that ever shipped — we span
+              // both, so a future bump (5+) is the only way this fires
+              // for an up-to-date connector.
+              parts.push(
+                `(gateway expects PROTOCOL_VERSION=${expected}; this bridge offers ${OPENCLAW_MIN_PROTOCOL}..${OPENCLAW_MAX_PROTOCOL})`,
+              )
+              parts.push(
+                `→ update @sophonai/bridge (npm i -g @sophonai/bridge@latest), or downgrade openclaw to a version with PROTOCOL_VERSION in ${OPENCLAW_MIN_PROTOCOL}..${OPENCLAW_MAX_PROTOCOL}`,
+              )
+            } else if (detailsRaw) {
+              parts.push(`details=${JSON.stringify(detailsRaw)}`)
+            }
+            const msg = parts.join(' ')
             this.log(`[openclaw] ${msg}`)
             reject(new Error(msg))
           }
@@ -543,6 +653,26 @@ export class OpenClawClient {
         // tick keepalive — ignore.
         if (type === 'event' && frame.event === 'tick') return
 
+        // Cron lifecycle. OpenClaw fires `event:cron` with a payload
+        // carrying { runId, jobId, jobName, sessionId, state, status, ... }
+        // for routine starts, progress, and completion. The bridge
+        // subscribes via `onCronEvent` to lazy-mint a Sophon session
+        // for each run and inject stream handlers (so subsequent
+        // `agent`/`chat`/`tool`/`approval` frames for the cron's runId
+        // route through the same machinery as user-initiated chats).
+        if (type === 'event' && frame.event === 'cron') {
+          const payload = (frame.payload ?? {}) as CronEventPayload
+          this.log(`[openclaw] cron event runId=${payload.runId ?? '?'} state=${payload.state ?? '?'} jobId=${payload.jobId ?? '?'}`)
+          for (const h of this.cronEventHandlers) {
+            try {
+              h(payload)
+            } catch (err) {
+              this.log(`[openclaw] cron handler threw: ${(err as Error).message}`)
+            }
+          }
+          return
+        }
+
         // Anything else: log with brief shape so unknown wire is visible.
         const ev = frame.event ?? type
         const shape = type === 'event'
@@ -552,12 +682,28 @@ export class OpenClawClient {
       })
 
       ws.once('close', () => {
+        const wasConnected = this.connected
         this.connected = false
         this.log('[openclaw] socket closed')
         // Reject all pending RPCs to unblock callers.
         for (const [id, p] of this.pending) {
           this.pending.delete(id)
           p.reject(new Error('socket closed'))
+        }
+        // Drop run-id maps — the openclaw process on the other side may
+        // have restarted; any cached run ids are stale. Stream handlers
+        // are tied to the (now-rejected) inflight chat.send calls — the
+        // bridge will retry via Sophon at the next user message.
+        this.streamHandlers.clear()
+        this.streamCumulative.clear()
+        this.sessionRunIds.clear()
+        this.pausedRunIds.clear()
+        this.toolPhasesSeen.clear()
+        // Kick reconnect loop. Only when we were actually connected
+        // (otherwise initial-connect failures fall through to caller
+        // via the `connect()` promise reject path).
+        if (wasConnected && !this.stopped && !this.reconnecting) {
+          void this.reconnectLoop()
         }
       })
       ws.once('error', (err) => {
@@ -570,6 +716,41 @@ export class OpenClawClient {
   stop(): void {
     this.stopped = true
     this.ws?.close()
+  }
+
+  /** Background loop: after the WS dropped, reconnect with
+   *  exponential backoff (cap RECONNECT_MAX_MS). Exits on `stop()` or
+   *  on the first successful `connect()`. The handshake inside
+   *  `connect()` resets `reconnectMs` back to MIN. */
+  private async reconnectLoop(): Promise<void> {
+    if (this.reconnecting) return
+    this.reconnecting = true
+    try {
+      while (!this.stopped) {
+        const jitter = Math.floor(Math.random() * 250)
+        const wait = Math.min(this.reconnectMs + jitter, RECONNECT_MAX_MS)
+        this.log(`[openclaw] reconnecting in ${wait}ms`)
+        await new Promise((r) => setTimeout(r, wait))
+        if (this.stopped) return
+        try {
+          await this.connect()
+          this.log('[openclaw] reconnected')
+          this.reconnectMs = RECONNECT_MIN_MS
+          for (const handler of this.reconnectListeners) {
+            try { handler() } catch { /* listener errors must not stall loop */ }
+          }
+          return
+        } catch (err) {
+          this.reconnectMs = Math.min(
+            Math.floor(this.reconnectMs * 1.8),
+            RECONNECT_MAX_MS,
+          )
+          this.log(`[openclaw] reconnect failed: ${(err as Error).message}`)
+        }
+      }
+    } finally {
+      this.reconnecting = false
+    }
   }
 
   /**
@@ -724,5 +905,137 @@ export class OpenClawClient {
       )
     })
     this.log(`[openclaw] ${method} resolved approvalId=${input.approvalId} decision=${input.decision}`)
+  }
+
+  /**
+   * Fetch the gateway's allowed model catalog. Mirrors `models.list`
+   * server-method (`reference/openclaw-full/src/gateway/server-methods/
+   * models.ts`) — read scope only, returns `{ models: ModelCatalogEntry[] }`
+   * filtered by `cfg`'s allowedModels.
+   *
+   * Entries follow the OpenClaw model-catalog shape:
+   *   { id, name, provider, alias?, contextWindow?, reasoning?, input?[] }
+   * iOS uses `id` as the value to send back through `sessions.patch`,
+   * `name` for the row label, `provider` for grouping, `input` for the
+   * vision/document affordance gate.
+   */
+  async modelsList(): Promise<{
+    models: Array<{
+      id: string
+      name: string
+      provider: string
+      alias?: string
+      contextWindow?: number
+      reasoning?: boolean
+      input?: ReadonlyArray<'text' | 'image' | 'document'>
+    }>
+  }> {
+    if (!this.connected || !this.ws) throw new Error('not connected')
+    const reqId = randomUUID()
+    const payload = await new Promise<unknown>((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject })
+      this.ws!.send(
+        JSON.stringify({ type: 'req', id: reqId, method: 'models.list', params: {} }),
+      )
+    })
+    const result = (payload ?? {}) as {
+      models?: Array<{
+        id: string
+        name: string
+        provider: string
+        alias?: string
+        contextWindow?: number
+        reasoning?: boolean
+        input?: ReadonlyArray<'text' | 'image' | 'document'>
+      }>
+    }
+    return { models: result.models ?? [] }
+  }
+
+  /**
+   * Patch a session's settings. Maps to `sessions.patch` server-method
+   * (`reference/openclaw-full/src/gateway/server-methods/sessions.ts`,
+   * admin scope). v1 surfaces only the `model` field — passing `null`
+   * resets to the agent's default; passing a model id stamps it on the
+   * session's `entry.modelOverride` so the next `chat.send` resolves it
+   * via `resolveSessionModelRef`.
+   *
+   * Idempotent on the gateway side: setting the same model twice is a
+   * no-op except for `updatedAt`. Bridge tracks `lastAppliedModel` per
+   * sessionKey to skip redundant round-trips on the hot send path; this
+   * RPC remains the canonical way to switch model.
+   */
+  async sessionsPatch(input: {
+    sessionKey: string
+    /** Model id from `models.list` (e.g. `"sonnet-4.6"`), or `null`
+     *  to reset the override and fall back to the agent default. */
+    model: string | null
+  }): Promise<void> {
+    if (!this.connected || !this.ws) throw new Error('not connected')
+    const reqId = randomUUID()
+    await new Promise<unknown>((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject })
+      this.ws!.send(
+        JSON.stringify({
+          type: 'req',
+          id: reqId,
+          method: 'sessions.patch',
+          params: { key: input.sessionKey, model: input.model },
+        }),
+      )
+    })
+    this.log(
+      `[openclaw] sessions.patch ack sessionKey=${input.sessionKey} model=${input.model ?? 'null'}`,
+    )
+  }
+
+  // MARK: - cron (routines) — wraps the gateway's `cron.*` server-methods
+  //
+  // OpenClaw is the source of truth for routines. Every Sophon UI call
+  // ends up here through the bridge's `cron.*.req` RPC dispatch. The
+  // params/results shapes are passed through unchanged — see
+  // `reference/openclaw-full/src/gateway/protocol/schema/cron.ts` for
+  // the canonical contract (CronJob, CronListParams, etc.).
+
+  /** Generic cron request — params and result are the gateway's wire shapes. */
+  private async cronRpc(
+    method:
+      | 'cron.list'
+      | 'cron.status'
+      | 'cron.add'
+      | 'cron.update'
+      | 'cron.remove'
+      | 'cron.run'
+      | 'cron.runs',
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (!this.connected || !this.ws) throw new Error('not connected')
+    const reqId = randomUUID()
+    return new Promise<unknown>((resolve, reject) => {
+      this.pending.set(reqId, { resolve, reject })
+      this.ws!.send(JSON.stringify({ type: 'req', id: reqId, method, params }))
+    })
+  }
+
+  cronList(params: Record<string, unknown> = {}): Promise<unknown> {
+    return this.cronRpc('cron.list', params)
+  }
+  cronStatus(): Promise<unknown> {
+    return this.cronRpc('cron.status', {})
+  }
+  cronAdd(params: Record<string, unknown>): Promise<unknown> {
+    return this.cronRpc('cron.add', params)
+  }
+  cronUpdate(params: Record<string, unknown>): Promise<unknown> {
+    return this.cronRpc('cron.update', params)
+  }
+  cronRemove(params: Record<string, unknown>): Promise<unknown> {
+    return this.cronRpc('cron.remove', params)
+  }
+  cronRun(params: Record<string, unknown>): Promise<unknown> {
+    return this.cronRpc('cron.run', params)
+  }
+  cronRuns(params: Record<string, unknown>): Promise<unknown> {
+    return this.cronRpc('cron.runs', params)
   }
 }

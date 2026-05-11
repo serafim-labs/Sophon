@@ -26,6 +26,8 @@ import {
 } from './crypto.js'
 import type { SophonClient, SophonUpdate } from './sophon.js'
 import type { OpenClawClient } from './openclaw.js'
+import type { SessionKeyStore } from './session-keys.js'
+import { formatRunErrorForChat } from './error-messages.js'
 
 /**
  * v1 cap for the file viewer. See docs/FILE_VIEWER_PLAN.md §9.2 — at
@@ -49,15 +51,11 @@ export interface BridgeOpts {
    */
   debugStream?: boolean
   /**
-   * 32-byte e2e install key from credentials.json. When set, every
-   * outbound payload that goes through `notifyToolFile`,
-   * `createTask`/`finishTask`, and `sendMessage*` gets encrypted
-   * before leaving this process — the server stores ciphertext and
-   * iOS decrypts on read. When unset (legacy bridge / pre-pairing
-   * upgrade), the bridge runs in plaintext mode same as v0.6.x.
-   * See docs/ENCRYPTION_PLAN.md §3 for which fields participate.
+   * Per-session symmetric key store. Bridge derives blob_keys for
+   * messages/tasks/approvals/agent_files from the right session_key
+   * for each call. Replaces the pre-0.12.0 install_key model.
    */
-  installKey?: Uint8Array
+  sessionKeyStore: SessionKeyStore
 }
 
 export class Bridge {
@@ -65,16 +63,82 @@ export class Bridge {
   private openclaw: OpenClawClient
   private log: (line: string) => void
   private debugStream: boolean
-  /** When non-null, all wire payloads are end-to-end encrypted. Wired
-   *  through `trackToolFile` (Phase 3.4 onwards). */
-  private installKey: Uint8Array | null
+  private sessionKeyStore: SessionKeyStore
+  /** Per-sessionKey cache of the last model id we applied via
+   *  OpenClaw `sessions.patch`. Used to skip redundant patches on the
+   *  hot send path: every `session.message` may carry a `session.model`
+   *  hint, but most turns it equals the previous value. Sentinel `''`
+   *  means "default / no override" (matches the API surfacing `null`
+   *  as "use agent default"). Lazily populated; missing key ⇒ unknown
+   *  state ⇒ patch on first observation. */
+  private lastAppliedModel = new Map<string, string>()
+  /** Per-sessionKey serialisation chain for `ensureSessionModel`. The
+   *  chat.send hot path and the dedicated `session.model.changed`
+   *  handler both call `ensureSessionModel`; without serialisation a
+   *  user changing model mid-send could race two `sessions.patch` RPCs
+   *  on the wire and the chat.send that follows the first patch could
+   *  see the second patch's value applied (or vice-versa, depending on
+   *  arrival order). Chaining ensures patches for the same sessionKey
+   *  apply in submission order, the cache is updated synchronously
+   *  with the patch's success/failure, and chat.send always sees the
+   *  model that the immediately-preceding ensure call requested. */
+  private patchChainBySession = new Map<string, Promise<void>>()
+  /** Backoff state for permanently-rejected model ids. Without this,
+   *  a session pinned to a model id that the gateway's allowedModels
+   *  list rejects (e.g. user typed a non-existent id, or the gateway
+   *  config dropped the model) loops `sessions.patch` on every send
+   *  forever — spamming logs and adding latency. After
+   *  MAX_PATCH_FAILURES consecutive failures for the same
+   *  (sessionKey, model) tuple we stop attempting until a different
+   *  model is requested. */
+  private failedModelAttempts = new Map<string, { model: string; count: number }>()
+  private static readonly MAX_PATCH_FAILURES = 3
+
+  /** Idempotency ring for incoming `session.message` updates, keyed by
+   *  the user message_id the cloud minted in /v1/me/sessions/:id/send.
+   *  Defense-in-depth against double-handling: two prod-observed paths
+   *  both produce two agent bubbles per user send — a real reply plus a
+   *  synthetic `[OpenClaw error] not connected` envelope racing the
+   *  same turn:
+   *   1. A SECOND bridge process running with the same bot token (the
+   *      one that hit us today — a stray `node dist/cli.js openclaw`
+   *      from a dev session orphaned itself with PPID=1 while launchd
+   *      ran the installed copy alongside it; both got the WS frame).
+   *   2. Stale cloud-side WS subscriptions across two fly machines (one
+   *      bridge conn lingers on machine A's `connsByInstallation` after
+   *      the bridge bounced to B; a publishBridgeEvent on either side
+   *      fans to both via pg-bus).
+   *  SophonClient already dedupes by `update_id`, but case (1) sees
+   *  distinct update_ids because each bridge's local seq counter is
+   *  separate — so the dedupe has to live at the per-user-message
+   *  layer here. CAP keeps the ring bounded for a long-lived bridge —
+   *  at >100 sends/hr it still covers the last several hours, way
+   *  past any plausible cloud-fanout retry window. */
+  private seenUserMessageIds = new Set<string>()
+  private static readonly SEEN_USER_MSG_CAP = 4096
+
+  /** Per-cron-runId Sophon session binding. OpenClaw fires multiple
+   *  `event:cron` frames per run (started, progress, completed), all
+   *  carrying the same runId. We mint the Sophon session on the FIRST
+   *  observation and reuse the binding for the rest of the run.
+   *  Cleared when the run finalises so a future run with a recycled
+   *  runId mints fresh state. */
+  private cronRunSessions = new Map<
+    string,
+    {
+      sessionId: string
+      messageId: string
+      jobName: string
+      accumulated: string
+    }
+  >()
 
   constructor(opts: BridgeOpts) {
     this.sophon = opts.sophon
     this.openclaw = opts.openclaw
     this.log = opts.log ?? (() => {})
     this.debugStream = opts.debugStream ?? false
-    this.installKey = opts.installKey ?? null
+    this.sessionKeyStore = opts.sessionKeyStore
   }
 
   private dbg(line: string): void {
@@ -90,6 +154,190 @@ export class Bridge {
   start(): void {
     this.sophon.onUpdate(async (u) => this.handleUpdate(u))
     this.sophon.onRequest(async (frame) => this.handleRpcRequest(frame))
+    // Cron-fired runs don't have a SAP `session.message` to anchor on
+    // — OpenClaw spins them up purely on its own schedule. Subscribe
+    // so we can mint a Sophon session lazily and route the run's
+    // agent/tool/approval stream into the same SAP surface user-driven
+    // chats use; iOS sees them as ordinary chats with `source: 'cron'`.
+    this.openclaw.onCronEvent((payload) => {
+      void this.handleCronEvent(payload)
+    })
+  }
+
+  /**
+   * Lazy-bind an OpenClaw cron run to a fresh Sophon session.
+   *
+   * Flow on first frame for a runId:
+   *   1. Create a Sophon chat session via /v1/bridge/createSession.
+   *      The server publishes `session_created` over SSE so iOS picks
+   *      it up in the chats list under `source: 'cron'`.
+   *   2. Open a streaming agent message (placeholder bubble).
+   *   3. Inject AgentStreamHandlers onto OpenClawClient for this runId
+   *      via `registerStreamHandlers`. Subsequent `event:agent`,
+   *      `event:chat`, tool, approval frames bound to that runId then
+   *      flow through the same delta → SAP fan-out used by the
+   *      user-driven `chat.send` path.
+   *
+   * Subsequent frames for the same runId hit the early-return; the
+   * already-registered handlers do the heavy lifting.
+   *
+   * Failure modes: if `createSession` or `startStreamingMessage` throws
+   * we log + bail. The cron run itself still completes on OpenClaw's
+   * side — the user just won't see it bridged into iOS for this run.
+   * No retry: by the time the next `event:cron` lands, the run may
+   * already be near-complete and a half-bridged transcript is worse
+   * than no transcript at all.
+   */
+  private async handleCronEvent(
+    payload: import('./openclaw.js').CronEventPayload,
+  ): Promise<void> {
+    const runId = payload.runId
+    if (!runId) return
+    if (this.cronRunSessions.has(runId)) return
+
+    let sessionId: string
+    let messageId: string
+    try {
+      const created = await this.sophon.createSession({ source: 'cron' })
+      sessionId = created.sessionId
+    } catch (err) {
+      this.log(`[bridge] cron createSession failed runId=${runId}: ${(err as Error).message}`)
+      return
+    }
+    try {
+      const started = await this.sophon.startStreamingMessage({ sessionId })
+      messageId = started.messageId
+    } catch (err) {
+      this.log(`[bridge] cron startStreamingMessage failed runId=${runId} sessionId=${sessionId}: ${(err as Error).message}`)
+      return
+    }
+
+    const binding = {
+      sessionId,
+      messageId,
+      jobName: payload.jobName ?? '',
+      accumulated: '',
+    }
+    this.cronRunSessions.set(runId, binding)
+    this.log(
+      `[bridge] cron run bound runId=${runId} jobId=${payload.jobId ?? '?'} jobName=${binding.jobName} sessionId=${sessionId}`,
+    )
+
+    // Serialise non-delta side-effects (tool create/update/finish,
+    // approvals, sendEnd) per run. Same shape as the user-chat path:
+    // order matters between create→update→finish; sendEnd must come
+    // last. Deltas use a separate, batched POST chain (no per-token
+    // round-trips) — see user-chat path for the same trick.
+    let chain: Promise<void> = Promise.resolve()
+    const enqueue = (work: () => Promise<void>) => {
+      chain = chain.then(work).catch((err) => {
+        this.log(`[bridge] cron sophon push failed runId=${runId}: ${(err as Error).message}`)
+      })
+    }
+
+    this.openclaw.registerStreamHandlers(runId, {
+      onTextDelta: (delta) => {
+        binding.accumulated += delta
+        enqueue(() => this.sophon.sendDelta({ messageId, sessionId, delta }))
+      },
+      onFinal: (final) => {
+        // Same logic as the user-chat path: skip `text` if we streamed
+        // bytes (server already has them); fall back only on tool-only
+        // turns where nothing streamed.
+        const fallbackText = binding.accumulated.length === 0
+          ? (final.text || '')
+          : undefined
+        enqueue(async () => {
+          await this.sophon.sendEnd({
+            messageId,
+            sessionId,
+            ...(fallbackText !== undefined ? { text: fallbackText } : {}),
+            usage: final.usage,
+          })
+          this.cronRunSessions.delete(runId)
+        })
+      },
+      onError: (msg) => {
+        enqueue(async () => {
+          await this.sophon.sendEnd({
+            messageId,
+            sessionId,
+            ...(binding.accumulated.length === 0
+              ? { text: formatRunErrorForChat(msg) }
+              : {}),
+          })
+          this.cronRunSessions.delete(runId)
+        })
+      },
+      onTool: (ev) => {
+        const argsSummary = summarizeArgs(ev.args)
+        const statusLabel = ev.phase === 'start'
+          ? `${ev.name}${argsSummary ? ` ${argsSummary}` : ''}`
+          : undefined
+        switch (ev.phase) {
+          case 'start':
+            enqueue(() => this.sophon.createTask({
+              sessionId,
+              taskId: ev.toolCallId,
+              kind: ev.name,
+              statusLabel,
+              args: ev.args,
+            }))
+            void this.trackToolFile(sessionId, ev.name, ev.args)
+            return
+          case 'update':
+            enqueue(() => this.sophon.updateTask({
+              sessionId,
+              taskId: ev.toolCallId,
+              partialResult: ev.partialResult,
+            }))
+            return
+          case 'result': {
+            const ok = !ev.isError
+            const errString = ev.isError
+              ? (typeof ev.result === 'string'
+                  ? ev.result
+                  : safeStringify(ev.result))
+              : undefined
+            enqueue(() => this.sophon.finishTask({
+              sessionId,
+              taskId: ev.toolCallId,
+              name: ev.name,
+              status: ok ? 'completed' : 'failed',
+              ...(errString ? { error: errString } : {}),
+              ...(ok ? { result: ev.result } : {}),
+            }))
+            return
+          }
+        }
+      },
+      onApproval: (ev) => {
+        if (ev.phase !== 'requested') return
+        const approvalId = ev.approvalId
+        if (!approvalId) {
+          this.log(`[bridge] cron approval.requested missing approvalId — dropping runId=${runId}`)
+          return
+        }
+        const action = ev.kind === 'plugin' ? 'plugin.invoke' : 'shell.exec'
+        const trimmedMsg = ev.message?.trim()
+        const messageBody = (trimmedMsg && trimmedMsg.length > 0)
+          ? trimmedMsg
+          : (ev.command ? `Run \`${ev.command}\`?` : ev.title)
+        const severity = ev.status === 'unavailable' ? 'critical' : 'medium'
+        enqueue(() => this.sophon.requestApproval({
+          sessionId,
+          approvalId,
+          approvalSlug: ev.approvalSlug,
+          action,
+          toolCallId: ev.toolCallId,
+          title: ev.title,
+          severity,
+          command: ev.command,
+          host: ev.host,
+          message: messageBody,
+        }))
+      },
+    })
   }
 
   /**
@@ -106,7 +354,69 @@ export class Bridge {
   ): Promise<Record<string, unknown>> {
     const type = String(frame.type ?? '')
     if (type === 'file.read.req') return this.handleFileRead(frame)
+    if (type === 'models.list.req') return this.handleModelsList()
+    if (type === 'cron.list.req') return this.handleCronRpc('list', frame)
+    if (type === 'cron.status.req') return this.handleCronRpc('status', frame)
+    if (type === 'cron.add.req') return this.handleCronRpc('add', frame)
+    if (type === 'cron.update.req') return this.handleCronRpc('update', frame)
+    if (type === 'cron.remove.req') return this.handleCronRpc('remove', frame)
+    if (type === 'cron.run.req') return this.handleCronRpc('run', frame)
+    if (type === 'cron.runs.req') return this.handleCronRpc('runs', frame)
     return { error: { code: 'unknown_request', type } }
+  }
+
+  /**
+   * Routines live in OpenClaw — the bridge is a thin proxy. Sophon
+   * server forwards `cron.<verb>.req` from iOS, we hand the params
+   * through to the gateway's `cron.<verb>` server-method, and pass the
+   * raw result back. Wire shapes are documented in
+   * `reference/openclaw-full/src/gateway/protocol/schema/cron.ts`.
+   */
+  private async handleCronRpc(
+    verb: 'list' | 'status' | 'add' | 'update' | 'remove' | 'run' | 'runs',
+    frame: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const params = (frame.params ?? {}) as Record<string, unknown>
+    try {
+      const result = await (() => {
+        switch (verb) {
+          case 'list': return this.openclaw.cronList(params)
+          case 'status': return this.openclaw.cronStatus()
+          case 'add': return this.openclaw.cronAdd(params)
+          case 'update': return this.openclaw.cronUpdate(params)
+          case 'remove': return this.openclaw.cronRemove(params)
+          case 'run': return this.openclaw.cronRun(params)
+          case 'runs': return this.openclaw.cronRuns(params)
+        }
+      })()
+      // Gateway returns raw result objects (CronJob, list, etc.);
+      // wrap so the server route can inspect `error` vs payload.
+      return { result: (result ?? {}) as Record<string, unknown> }
+    } catch (err) {
+      return {
+        error: {
+          code: `cron_${verb}_failed`,
+          message: (err as Error).message,
+        },
+      }
+    }
+  }
+
+  /**
+   * Surfaces OpenClaw's `models.list` to the SAP server so iOS can
+   * populate the composer's model picker dynamically. The catalog is
+   * the gateway's allowedModels intersected with the loaded provider
+   * registry — exactly what `entry.modelOverride` (set via
+   * `sessions.patch`) is allowed to take. iOS uses entry `id` as the
+   * value to PATCH back.
+   */
+  private async handleModelsList(): Promise<Record<string, unknown>> {
+    try {
+      const result = await this.openclaw.modelsList()
+      return { models: result.models }
+    } catch (err) {
+      return { error: { code: 'models_list_failed', message: (err as Error).message } }
+    }
   }
 
   /**
@@ -152,16 +462,15 @@ export class Bridge {
     let blobKey: Uint8Array | null = null
 
     if (sessionId && blindIdx && pathCtBase64) {
-      // E2E mode. install_key is non-optional here.
-      if (!this.installKey) {
-        // Bridge has no install_key but server forwarded an e2e
-        // request. Mismatch shouldn't happen if iOS only sends
-        // blind_idx when it has a key, but be defensive.
-        return { error: { code: 'no_install_key' } }
+      // E2E mode. session_key required — must have been granted by
+      // a sibling device or generated locally before this request.
+      const sessionKey = this.sessionKeyStore.get(sessionId)
+      if (!sessionKey) {
+        return { error: { code: 'no_session_key' } }
       }
       try {
         blobKey = deriveBlobKey(
-          this.installKey,
+          sessionKey,
           `agent_files/${sessionId}/${blindIdx}`,
         )
       } catch (err: unknown) {
@@ -280,15 +589,137 @@ export class Bridge {
       case 'session.cancelled':
         await this.handleSessionCancelled(u)
         return
+      case 'session.model.changed':
+        await this.handleSessionModelChanged(u)
+        return
       case 'approval.resolved':
         await this.handleApprovalResolved(u)
         return
       case 'installation.created':
       case 'installation.revoked':
         return
+      case 'device_added':
+        await this.handleDeviceAdded(u)
+        return
+      case 'session_key_granted':
+        await this.handleSessionKeyGranted(u)
+        return
+      case 'device_revoked':
+        // Surviving iOS device(s) will rotate session_keys client-side
+        // and POST grants; we receive those as ordinary
+        // session_key_granted events and overwrite our local session_key
+        // (SessionKeyStore.set is overwrite-by-default). Nothing to do
+        // here beyond logging — left as a hook in case we later want to
+        // proactively drop cached state.
+        this.log(`[bridge] device_revoked id=${(u.payload as { device_id?: string })?.device_id ?? '?'}`)
+        return
       default:
         this.log(`[bridge] ignoring update type ${u.type}`)
     }
+  }
+
+  /** Sibling device joined the user account — wrap every session_key
+   *  we hold under the new device's pubkey and POST grants. The bridge
+   *  is the durable always-online grantor for cold-handoff cases (no
+   *  iOS device awake to do the wrap itself). */
+  private async handleDeviceAdded(u: SophonUpdate): Promise<void> {
+    const payload = u.payload as {
+      device_id?: string
+      pubkey?: string
+      label?: string
+      platform?: string
+      installation_id?: string | null
+    }
+    const deviceId = payload?.device_id
+    const pubkeyHex = payload?.pubkey
+    if (!deviceId || typeof pubkeyHex !== 'string' || !/^[0-9a-f]{64}$/.test(pubkeyHex)) {
+      this.log(`[bridge] device_added: malformed payload, ignoring`)
+      return
+    }
+    // Don't grant to ourselves — we already hold every session_key
+    // in plaintext locally. Server lets us post anyway, but it would
+    // overwrite the existing self-recipient row uselessly.
+    if (payload.platform === 'bridge') return
+
+    // Lazy-import to avoid a circular reference between bridge.ts and
+    // crypto.ts at module-load time. (The dynamic import resolves the
+    // sealed-box primitive after both modules have finished initial
+    // evaluation.)
+    const { sealedBoxEncrypt } = await import('./crypto.js')
+    const recipientPubkey = new Uint8Array(Buffer.from(pubkeyHex, 'hex'))
+
+    const entries = this.sessionKeyStore.entries()
+    if (entries.length === 0) return
+
+    // Group by sessionId (one POST per session for now — bulk inside
+    // the array). Bridge typically has 1-10 sessions; keep it simple.
+    let granted = 0
+    for (const [sessionId, sessionKey] of entries) {
+      try {
+        const wrapped = sealedBoxEncrypt(sessionKey, recipientPubkey)
+        const wrappedB64 = Buffer.from(wrapped).toString('base64')
+        await this.sophon.postBridgeSessionRecipients({
+          sessionId,
+          recipients: [{ deviceId, wrappedSessionKeyB64: wrappedB64 }],
+          ...(this.bridgeDeviceId ? { wrappedByDeviceId: this.bridgeDeviceId } : {}),
+        })
+        granted++
+      } catch (err) {
+        this.log(`[bridge] grant ${sessionId} → ${deviceId} failed: ${(err as Error).message}`)
+      }
+    }
+    this.log(`[bridge] device_added ${deviceId} — granted ${granted}/${entries.length} sessions`)
+  }
+
+  /** Server forwarded a session_key from a sibling that wrapped it
+   *  for our pubkey. Unwrap, store. Used when the bridge wasn't the
+   *  session creator (rare in OpenClaw flows; iOS-creates-session is
+   *  the typical path). */
+  private async handleSessionKeyGranted(u: SophonUpdate): Promise<void> {
+    const payload = u.payload as {
+      session_id?: string
+      device_id?: string
+      wrapped_session_key?: string
+    }
+    const sessionId = payload?.session_id
+    const wrappedB64 = payload?.wrapped_session_key
+    if (!sessionId || typeof wrappedB64 !== 'string') {
+      this.log(`[bridge] session_key_granted: malformed payload`)
+      return
+    }
+    if (payload.device_id && this.bridgeDeviceId && payload.device_id !== this.bridgeDeviceId) {
+      // Grant addressed to a different device — server should have
+      // filtered, but be defensive.
+      return
+    }
+    if (!this.bridgeSecretKey) {
+      this.log(`[bridge] session_key_granted: no bridge secret key on hand`)
+      return
+    }
+    try {
+      const { sealedBoxDecrypt } = await import('./crypto.js')
+      const envelope = new Uint8Array(Buffer.from(wrappedB64, 'base64'))
+      const plain = sealedBoxDecrypt(envelope, this.bridgeSecretKey)
+      if (!plain || plain.length !== 32) {
+        this.log(`[bridge] session_key_granted ${sessionId}: unwrap failed or wrong length`)
+        return
+      }
+      await this.sessionKeyStore.set(sessionId, plain)
+      this.log(`[bridge] session_key_granted ${sessionId} stored`)
+    } catch (err) {
+      this.log(`[bridge] session_key_granted ${sessionId} errored: ${(err as Error).message}`)
+    }
+  }
+
+  /** Late-bound device id + secret — set by the orchestrator after
+   *  POST /v1/bridge/devices completes. Both must be set before we
+   *  can do `wrappedByDeviceId` audit attribution or unwrap incoming
+   *  grants in `handleSessionKeyGranted`. */
+  private bridgeDeviceId: string | null = null
+  private bridgeSecretKey: Uint8Array | null = null
+  setBridgeIdentity(deviceId: string, secretKey: Uint8Array): void {
+    this.bridgeDeviceId = deviceId
+    this.bridgeSecretKey = secretKey
   }
 
   /**
@@ -357,10 +788,126 @@ export class Bridge {
     }
   }
 
+  /**
+   * Apply the per-session model override on OpenClaw if it differs
+   * from the last value we patched for this `sessionKey`. Called both
+   * from the dedicated `session.model.changed` update AND inline from
+   * the hot `session.message` path — every message payload carries
+   * the current `session.model` so a user who taps the model sheet
+   * immediately followed by Send sees the new model applied even if
+   * the cross-WS `session.model.changed` didn't land first.
+   *
+   * **Serialised per sessionKey** via `patchChainBySession` so two
+   * concurrent calls (e.g. message + model-change interleave) cannot
+   * race their `sessions.patch` RPCs on the wire — without this the
+   * patch the chat.send awaited could be overtaken by a later patch
+   * before chat.send fires, applying the wrong model to the run.
+   *
+   * **Bounded retry on permanent failure**: the gateway rejects
+   * unknown / disallowed model ids with the same error every time;
+   * after `MAX_PATCH_FAILURES` consecutive failures for the same
+   * `(sessionKey, model)` tuple, subsequent calls log + skip the RPC
+   * until a different model is requested. Prevents an infinite-retry
+   * loop on every send for a session pinned to a bad id.
+   *
+   * Idempotent on the gateway side; the local cache only avoids the
+   * round-trip on no-op turns. `desired === null` (or empty) ⇒ "use
+   * agent default" ⇒ clear override on OpenClaw. Stored as `''`
+   * sentinel in the cache so a freshly-set null doesn't look like
+   * "unknown state".
+   */
+  private async ensureSessionModel(
+    sessionKey: string,
+    desired: string | null,
+  ): Promise<void> {
+    const prev = this.patchChainBySession.get(sessionKey) ?? Promise.resolve()
+    const work = prev.then(() => this.applySessionModel(sessionKey, desired))
+    // Always store the latest tail; cleanup once it settles so an idle
+    // session doesn't pin a resolved promise forever.
+    this.patchChainBySession.set(sessionKey, work)
+    work.finally(() => {
+      if (this.patchChainBySession.get(sessionKey) === work) {
+        this.patchChainBySession.delete(sessionKey)
+      }
+    })
+    return work
+  }
+
+  /** Inner body of `ensureSessionModel`. Runs serially per sessionKey
+   *  via the chain in `ensureSessionModel`. Caller MUST not invoke
+   *  directly — that would defeat the serialisation. */
+  private async applySessionModel(
+    sessionKey: string,
+    desired: string | null,
+  ): Promise<void> {
+    const next = desired ?? ''
+    const last = this.lastAppliedModel.get(sessionKey)
+    if (last !== undefined && last === next) return
+
+    // Bounded-retry guard. If the previous N attempts for this exact
+    // (sessionKey, model) all failed, the gateway is rejecting it for
+    // a permanent reason (unknown id, disallowed by config); retrying
+    // every send wastes a round-trip. The guard is cleared as soon as
+    // a different `next` value is requested — switching model unblocks
+    // a session that got pinned to a bad id.
+    const failure = this.failedModelAttempts.get(sessionKey)
+    if (failure && failure.model === next && failure.count >= Bridge.MAX_PATCH_FAILURES) {
+      // Already warned at the threshold-crossing call; downgrade follow-
+      // ups to a single dbg line so we don't spam the operator log.
+      this.dbg(
+        `sessions.patch skipped sessionKey=${sessionKey} model=${next || 'null'} — quarantined after ${failure.count} failures`,
+      )
+      return
+    }
+
+    try {
+      await this.openclaw.sessionsPatch({ sessionKey, model: next === '' ? null : next })
+      this.lastAppliedModel.set(sessionKey, next)
+      this.failedModelAttempts.delete(sessionKey)
+    } catch (err) {
+      const failureCount =
+        failure && failure.model === next ? failure.count + 1 : 1
+      this.failedModelAttempts.set(sessionKey, { model: next, count: failureCount })
+      const tail =
+        failureCount >= Bridge.MAX_PATCH_FAILURES
+          ? ` — quarantining (will skip until model changes)`
+          : ` — will retry on next send`
+      this.log(
+        `[bridge] sessions.patch failed sessionKey=${sessionKey} model=${next || 'null'} attempt=${failureCount}: ${(err as Error).message}${tail}`,
+      )
+      // Don't poison `lastAppliedModel` — leave it unset so a future
+      // call with the same `next` still attempts (until quarantined).
+      // The send proceeds with whatever model the gateway already had
+      // applied; better a slightly-stale model than a dropped turn.
+    }
+  }
+
+  /**
+   * iOS user picked a different model in the composer sheet → server
+   * persisted on `chat_sessions.model` and pushed `session.model.changed`
+   * here. Forward to OpenClaw via `sessions.patch`. The session.message
+   * hot path also carries the current model and runs the same RPC, so
+   * this update mainly matters for "user picks model but doesn't send"
+   * — without it the next turn would race the patch against chat.send.
+   */
+  private async handleSessionModelChanged(u: SophonUpdate): Promise<void> {
+    const payload = u.payload as { session?: { id?: string }; model?: string | null }
+    const sessionId = payload.session?.id ?? u.session_id
+    if (!sessionId) {
+      this.log(`[bridge] session.model.changed missing session.id`)
+      return
+    }
+    const model = typeof payload.model === 'string' && payload.model.length > 0
+      ? payload.model
+      : null
+    await this.ensureSessionModel(sessionId, model)
+  }
+
   private async handleSessionMessage(u: SophonUpdate): Promise<void> {
     const payload = u.payload as {
-      session?: { id?: string }
+      session?: { id?: string; model?: string | null }
       message?: {
+        id?: string
         text?: string
         text_ct?: string
         attachments?: Array<{
@@ -372,23 +919,45 @@ export class Bridge {
       }
     }
     const sessionId = payload.session?.id ?? u.session_id ?? ''
+    // Per-user-message idempotency guard — drops the second invocation
+    // when a second bridge process or a stale cloud subscription
+    // delivers the same `session.message` again. See seenUserMessageIds
+    // field docs for the full story. The cloud's user-message_id is
+    // unique per /v1/me/sessions/:id/send, so it's the right dedup key.
+    const msgId = payload.message?.id
+    if (msgId) {
+      if (this.seenUserMessageIds.has(msgId)) {
+        this.log(`[bridge] duplicate session.message user_msg_id=${msgId} update_id=${u.update_id} — dropped`)
+        return
+      }
+      this.seenUserMessageIds.add(msgId)
+      if (this.seenUserMessageIds.size > Bridge.SEEN_USER_MSG_CAP) {
+        const first = this.seenUserMessageIds.values().next().value
+        if (first !== undefined) this.seenUserMessageIds.delete(first)
+      }
+    }
     // E2E mode: server-blind iOS encrypted the user's text. Decrypt
     // with the per-session messages blob_key derived from install_key.
     // OpenClaw expects plaintext; the bridge is the trust boundary.
     let text = payload.message?.text ?? ''
     const textCt = payload.message?.text_ct
-    if (textCt && this.installKey) {
-      try {
-        const blobKey = deriveBlobKey(this.installKey, `messages/${sessionId}`)
-        const envelope = Buffer.from(textCt, 'base64')
-        const plain = decryptSymmetric(new Uint8Array(envelope), blobKey)
-        if (plain) {
-          text = new TextDecoder().decode(plain)
-        } else {
-          this.log(`[bridge] decrypt session.message text failed — falling back to plaintext`)
+    if (textCt) {
+      const sessionKey = this.sessionKeyStore.get(sessionId)
+      if (!sessionKey) {
+        this.log(`[bridge] decrypt session.message: no session_key for ${sessionId}`)
+      } else {
+        try {
+          const blobKey = deriveBlobKey(sessionKey, `messages/${sessionId}`)
+          const envelope = Buffer.from(textCt, 'base64')
+          const plain = decryptSymmetric(new Uint8Array(envelope), blobKey)
+          if (plain) {
+            text = new TextDecoder().decode(plain)
+          } else {
+            this.log(`[bridge] decrypt session.message text failed — falling back to plaintext`)
+          }
+        } catch (err) {
+          this.log(`[bridge] decrypt session.message text errored: ${(err as Error).message}`)
         }
-      } catch (err) {
-        this.log(`[bridge] decrypt session.message text errored: ${(err as Error).message}`)
       }
     }
     if (!sessionId || !text) {
@@ -424,6 +993,18 @@ export class Bridge {
         this.log(`[bridge] attachment fetch failed: ${(err as Error).message}`)
       }
     }
+
+    // Apply the per-session model override BEFORE chat.send so the
+    // gateway resolves `entry.modelOverride` to the right value when
+    // it spins up (or continues) the run. `payload.session.model` is
+    // the canonical wire field; `null` / undefined ⇒ "use agent
+    // default". Cached per sessionKey so repeated turns with the same
+    // model are a single in-process branch, no round-trip.
+    const desiredModel = (() => {
+      const raw = (payload.session as { model?: string | null } | undefined)?.model
+      return typeof raw === 'string' && raw.length > 0 ? raw : null
+    })()
+    await this.ensureSessionModel(sessionId, desiredModel)
 
     // 1. Pre-create a streaming agent message in Sophon so iOS sees a
     //    placeholder bubble immediately (otherwise the user waits in
@@ -550,16 +1131,19 @@ export class Bridge {
             // sendEnd would race ahead of the final delta(s) and the
             // server would 409 them with `message_finalized`.
             //
-            // Skip `text` if we streamed anything — server already
-            // has the full accumulated text. Sending it again would
-            // overwrite with `final.text`, which sometimes carries
-            // whitespace-normalised wording from the LLM and looks
-            // like a flicker. Only fall back to `final.text` when no
-            // deltas streamed at all (rare; tool-only turns).
-            const fallbackText = accumulated.length === 0
-              ? (final.text || '')
-              : undefined
-            this.dbg(`onFinal triggered deltaCount=${deltaCount} acc=${accumulated.length} finalTextLen=${(final.text ?? '').length} fallback=${fallbackText !== undefined ? 'yes' : 'no'} +${Date.now() - turnStartedAt}ms`)
+            // ALWAYS send the canonical full text on sendEnd. Server
+            // `/v1/bridge/sendMessageDelta` only forwards deltas over
+            // SSE — it never accumulates them into `messages.text_ct`.
+            // Without `text` here the row's text_ct stays NULL → next
+            // history fetch returns an empty bubble, and iOS' in-memory
+            // copy is also clobbered by the empty `message_finalized`
+            // payload. Prefer our accumulated string (what iOS actually
+            // saw stream); fall back to `final.text` when nothing
+            // streamed (tool-only turns).
+            const finalText = accumulated.length > 0
+              ? accumulated
+              : (final.text || '')
+            this.dbg(`onFinal triggered deltaCount=${deltaCount} acc=${accumulated.length} finalTextLen=${(final.text ?? '').length} sentLen=${finalText.length} +${Date.now() - turnStartedAt}ms`)
             enqueue(async () => {
               this.dbg(`sendEnd START drainStart=${Date.now() - turnStartedAt}ms`)
               await drainDeltas()
@@ -567,7 +1151,7 @@ export class Bridge {
               await this.sophon.sendEnd({
                 messageId,
                 sessionId,
-                ...(fallbackText !== undefined ? { text: fallbackText } : {}),
+                text: finalText,
                 usage: final.usage,
               })
               this.dbg(`sendEnd OK    took=${Date.now() - t0}ms totalTurn=${Date.now() - turnStartedAt}ms flushes=${flushCount} deltas=${deltaCount}`)
@@ -585,7 +1169,7 @@ export class Bridge {
                 // them — ending without `text` keeps the partial
                 // visible (truthful "the agent died mid-reply" UX).
                 ...(accumulated.length === 0
-                  ? { text: `[OpenClaw error] ${msg}` }
+                  ? { text: formatRunErrorForChat(msg) }
                   : {}),
               })
             })
@@ -694,7 +1278,7 @@ export class Bridge {
       await this.sophon.sendEnd({
         messageId,
         sessionId,
-        text: `[OpenClaw error] ${(err as Error).message}`,
+        text: formatRunErrorForChat(err),
       })
     }
   }
@@ -739,26 +1323,23 @@ export class Bridge {
     } catch {
       // Don't bail — size is optional metadata.
     }
-    // E2E: encrypt path + display_name and compute the blind index.
-    // Required post Phase 4b — server has no plaintext columns. Skip
-    // the file silently when there's no install_key (un-paired bridge
-    // — shouldn't happen since installation_id is also required for
-    // any of this, but defensive).
-    if (!this.installKey) {
-      this.log(`[crypto] trackToolFile skipped: bridge has no install_key`)
+    // E2E: encrypt path + display_name and compute the blind index
+    // under the per-session session_key. Skip silently when we don't
+    // have a key for this session yet (transient state — a sibling
+    // grant should be in flight).
+    const sessionKey = this.sessionKeyStore.get(sessionId)
+    if (!sessionKey) {
+      this.log(`[crypto] trackToolFile skipped: no session_key for ${sessionId}`)
       return
     }
     let pathCt: string
     let displayNameCt: string
     let pathBlindIdx: string
     try {
-      // Compute the blind index FIRST — it's part of the per-row
-      // blob_key derivation path (so each row gets its own AES key
-      // even within the same installation).
-      const idxKey = deriveBlindIndexKey(this.installKey)
+      const idxKey = deriveBlindIndexKey(sessionKey)
       pathBlindIdx = blindIndex(idxKey, 'agent_files', sessionId, real)
       const blobKey = deriveBlobKey(
-        this.installKey,
+        sessionKey,
         `agent_files/${sessionId}/${pathBlindIdx}`,
       )
       pathCt = Buffer.from(
